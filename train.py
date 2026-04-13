@@ -47,6 +47,9 @@ parser.add_argument('--B0_dim', default=128, type=int)
 parser.add_argument('--B1_dim', default=64, type=int)
 parser.add_argument('--halting_threshold', default=0.0285, type=float)
 parser.add_argument('--acc7_loss_weight', default=0.2, type=float)
+parser.add_argument('--syntax_temperature', default=1.0, type=float)
+parser.add_argument('--merge_trace_samples', default=3, type=int)
+parser.add_argument('--max_grad_norm', default=1.0, type=float)
 
 args = parser.parse_args()
 
@@ -64,6 +67,13 @@ class InputFeatures(object):
         self.input_mask = input_mask
         self.segment_ids = segment_ids
         self.label_id = label_id
+
+
+def safe_min_max_normalize(tensor: torch.Tensor) -> torch.Tensor:
+    tensor = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+    tensor_min = tensor.amin()
+    tensor_range = (tensor.amax() - tensor_min).clamp_min(1e-6)
+    return (tensor - tensor_min) / tensor_range
 
 
 def convert_to_features(examples, max_seq_length, tokenizer):
@@ -282,14 +292,15 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
     nb_tr_examples, nb_tr_steps = 0, 0
     regression_loss_fct = MSELoss()
     acc7_loss_fct = CrossEntropyLoss()
+    encountered_nonfinite = False
     for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
         batch = tuple(t.to(DEVICE) for t in batch)
         input_ids, visual, acoustic, label_ids = batch
         visual = torch.squeeze(visual, 1)
         acoustic = torch.squeeze(acoustic, 1)
 
-        visual_norm = (visual - visual.min()) / (visual.max() - visual.min())
-        acoustic_norm = (acoustic - acoustic.min()) / (acoustic.max() - acoustic.min())
+        visual_norm = safe_min_max_normalize(visual)
+        acoustic_norm = safe_min_max_normalize(acoustic)
         logits, acc7_logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps = model(
             input_ids,
             visual_norm,
@@ -299,6 +310,18 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
         acc7_targets = build_acc7_targets(label_ids.view(-1))
         acc7_loss = acc7_loss_fct(acc7_logits.view(-1, 7), acc7_targets)
         loss = regression_loss + args.acc7_loss_weight * acc7_loss + 2 / (args.p_beta + args.p_gamma) * IB_loss
+
+        if not torch.isfinite(loss):
+            print(
+                "NONFINITE_TRAIN: step:{}, regression_loss:{}, acc7_loss:{}, ib_loss:{}".format(
+                    step + 1,
+                    regression_loss.detach().item(),
+                    acc7_loss.detach().item(),
+                    IB_loss.detach().item(),
+                )
+            )
+            encountered_nonfinite = True
+            break
 
         if args.gradient_accumulation_step > 1:
             loss = loss / args.gradient_accumulation_step
@@ -312,11 +335,15 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
         nb_tr_steps += 1
 
         if (step + 1) % args.gradient_accumulation_step == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
 
-    return tr_loss / nb_tr_steps, recursion_steps_total / nb_tr_examples, max_depth_hits / nb_tr_examples
+    if nb_tr_steps == 0 or nb_tr_examples == 0:
+        return float("nan"), 0.0, 0.0, encountered_nonfinite
+
+    return tr_loss / nb_tr_steps, recursion_steps_total / nb_tr_examples, max_depth_hits / nb_tr_examples, encountered_nonfinite
 
 
 def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
@@ -327,6 +354,7 @@ def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
     nb_dev_examples, nb_dev_steps = 0, 0
     regression_loss_fct = MSELoss()
     acc7_loss_fct = CrossEntropyLoss()
+    encountered_nonfinite = False
     with torch.no_grad():
         for step, batch in enumerate(tqdm(dev_dataloader, desc="Iteration")):
             batch = tuple(t.to(DEVICE) for t in batch)
@@ -334,8 +362,8 @@ def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
             visual = torch.squeeze(visual, 1)
             acoustic = torch.squeeze(acoustic, 1)
 
-            visual_norm = (visual - visual.min()) / (visual.max() - visual.min())
-            acoustic_norm = (acoustic - acoustic.min()) / (acoustic.max() - acoustic.min())
+            visual_norm = safe_min_max_normalize(visual)
+            acoustic_norm = safe_min_max_normalize(acoustic)
 
             logits, acc7_logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps = model(
                 input_ids,
@@ -347,6 +375,17 @@ def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
             acc7_loss = acc7_loss_fct(acc7_logits.view(-1, 7), acc7_targets)
             loss = regression_loss + args.acc7_loss_weight * acc7_loss
 
+            if not torch.isfinite(loss):
+                print(
+                    "NONFINITE_VALID: step:{}, regression_loss:{}, acc7_loss:{}".format(
+                        step + 1,
+                        regression_loss.detach().item(),
+                        acc7_loss.detach().item(),
+                    )
+                )
+                encountered_nonfinite = True
+                break
+
             if args.gradient_accumulation_step > 1:
                 loss = loss / args.gradient_accumulation_step
 
@@ -356,7 +395,10 @@ def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
             nb_dev_examples += recursive_steps.size(0)
             nb_dev_steps += 1
 
-    return dev_loss / nb_dev_steps, recursion_steps_total / nb_dev_examples, max_depth_hits / nb_dev_examples
+    if nb_dev_steps == 0 or nb_dev_examples == 0:
+        return float("nan"), 0.0, 0.0, encountered_nonfinite
+
+    return dev_loss / nb_dev_steps, recursion_steps_total / nb_dev_examples, max_depth_hits / nb_dev_examples, encountered_nonfinite
 
 
 def test_epoch(model: nn.Module, test_dataloader: DataLoader):
@@ -366,6 +408,9 @@ def test_epoch(model: nn.Module, test_dataloader: DataLoader):
     recursion_steps_total = 0.0
     max_depth_hits = 0
     sample_count = 0
+    syntax_samples = []
+    tokenizer = get_tokenizer(args.model) if args.merge_trace_samples > 0 else None
+    pad_token_id = tokenizer.pad_token_id if tokenizer is not None and tokenizer.pad_token_id is not None else 0
 
     with torch.no_grad():
         for batch in tqdm(test_dataloader):
@@ -375,18 +420,41 @@ def test_epoch(model: nn.Module, test_dataloader: DataLoader):
             visual = torch.squeeze(visual, 1)
             acoustic = torch.squeeze(acoustic, 1)
 
-            visual_norm = (visual - visual.min()) / (visual.max() - visual.min())
-            acoustic_norm = (acoustic - acoustic.min()) / (acoustic.max() - acoustic.min())
+            visual_norm = safe_min_max_normalize(visual)
+            acoustic_norm = safe_min_max_normalize(acoustic)
 
-            logits, acc7_logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps = model(
+            model_outputs = model(
                 input_ids,
                 visual_norm,
                 acoustic_norm,
+                return_syntax_info=tokenizer is not None,
             )
+
+            if tokenizer is not None:
+                logits, acc7_logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps, syntax_info = model_outputs
+            else:
+                logits, acc7_logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps = model_outputs
+                syntax_info = None
 
             recursion_steps_total += recursive_steps.float().sum().item()
             max_depth_hits += (recursive_steps == global_configs.MAX_RECURSION_DEPTH).sum().item()
             sample_count += recursive_steps.size(0)
+
+            if syntax_info is not None and len(syntax_samples) < args.merge_trace_samples:
+                sample_logits = logits.view(-1).detach().cpu()
+                sample_labels = label_ids.view(-1).detach().cpu()
+                sample_input_ids = input_ids.detach().cpu()
+                remaining_slots = args.merge_trace_samples - len(syntax_samples)
+
+                for sample_idx in range(min(remaining_slots, sample_input_ids.size(0))):
+                    valid_ids = sample_input_ids[sample_idx][sample_input_ids[sample_idx].ne(pad_token_id)].tolist()
+                    syntax_samples.append({
+                        "prediction": float(sample_logits[sample_idx].item()),
+                        "label": float(sample_labels[sample_idx].item()),
+                        "tokens": tokenizer.convert_ids_to_tokens(valid_ids),
+                        "merge_trace": syntax_info["merge_traces"][sample_idx],
+                        "syntax_tree": syntax_info["syntax_trees"][sample_idx],
+                    })
 
             logits = logits.detach().cpu().numpy()
             label_ids = label_ids.detach().cpu().numpy()
@@ -403,7 +471,7 @@ def test_epoch(model: nn.Module, test_dataloader: DataLoader):
     avg_recursion_steps = recursion_steps_total / sample_count if sample_count > 0 else 0.0
     max_depth_hit_rate = max_depth_hits / sample_count if sample_count > 0 else 0.0
 
-    return preds, labels, avg_recursion_steps, max_depth_hit_rate
+    return preds, labels, avg_recursion_steps, max_depth_hit_rate, syntax_samples
 
 
 def build_acc7_targets(labels):
@@ -424,8 +492,22 @@ def acc7_score(preds, labels):
     return multiclass_acc(np.clip(preds, -3.0, 3.0), np.clip(labels, -3.0, 3.0))
 
 
+def print_merge_trace_samples(syntax_samples):
+    for sample_idx, sample in enumerate(syntax_samples, start=1):
+        print(
+            "MERGE_TRACE[{}]: pred:{:.4f}, label:{:.4f}, trace:{}, tree:{}, tokens:{}".format(
+                sample_idx,
+                sample["prediction"],
+                sample["label"],
+                sample["merge_trace"],
+                sample["syntax_tree"],
+                " ".join(sample["tokens"]),
+            )
+        )
+
+
 def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero=False, return_acc7=False):
-    preds, y_test, avg_recursion_steps, max_depth_hit_rate = test_epoch(model, test_dataloader)
+    preds, y_test, avg_recursion_steps, max_depth_hit_rate, syntax_samples = test_epoch(model, test_dataloader)
     acc7 = acc7_score(preds, y_test)
     non_zeros = np.array(
         [i for i, e in enumerate(y_test) if e != 0 or use_zero])
@@ -443,9 +525,9 @@ def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero=Fal
     acc = accuracy_score(y_test, preds)
 
     if return_acc7:
-        return acc, acc7, mae, corr, f_score, avg_recursion_steps, max_depth_hit_rate
+        return acc, acc7, mae, corr, f_score, avg_recursion_steps, max_depth_hit_rate, syntax_samples
 
-    return acc, mae, corr, f_score, avg_recursion_steps, max_depth_hit_rate
+    return acc, mae, corr, f_score, avg_recursion_steps, max_depth_hit_rate, syntax_samples
 
 
 def train(
@@ -471,8 +553,8 @@ def train(
     best_valid_hit_rate = None
 
     for epoch_i in range(int(args.n_epochs)):
-        train_loss, train_avg_steps, train_hit_rate = train_epoch(model, train_dataloader, optimizer, scheduler)
-        valid_loss, valid_avg_steps, valid_hit_rate = eval_epoch(model, validation_dataloader)
+        train_loss, train_avg_steps, train_hit_rate, train_nonfinite = train_epoch(model, train_dataloader, optimizer, scheduler)
+        valid_loss, valid_avg_steps, valid_hit_rate, valid_nonfinite = eval_epoch(model, validation_dataloader)
 
         if valid_loss < best_valid_loss:
             best_valid_loss = valid_loss
@@ -490,10 +572,14 @@ def train(
             )
         )
 
+        if train_nonfinite or valid_nonfinite:
+            print("EARLY_STOP: non-finite loss encountered at epoch:{}".format(epoch_i + 1))
+            break
+
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
 
-    test_acc, test_acc7, test_mae, test_corr, test_f_score, test_avg_steps, test_hit_rate = test_score_model(
+    test_acc, test_acc7, test_mae, test_corr, test_f_score, test_avg_steps, test_hit_rate, syntax_samples = test_score_model(
         model, test_data_loader, return_acc7=True
     )
     print(
@@ -503,6 +589,7 @@ def train(
             test_avg_steps, test_hit_rate
         )
     )
+    print_merge_trace_samples(syntax_samples)
     return best_train_loss, best_valid_loss, test_acc, test_mae, test_corr, test_f_score
 
 
