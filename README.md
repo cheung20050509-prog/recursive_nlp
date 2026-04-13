@@ -15,14 +15,16 @@ Drawing on neurological models, the ITHP model employs the information bottlenec
 ## Quick Start
 
 1. Clone the repository and install dependencies:
+
    ```bash
    git clone https://github.com/joshuaxiao98/ITHP.git
    pip install -r requirements.txt
    ```
 
-2. Download the datasets to `./datasets` by running `download_datasets.sh`. For details, see [here](https://github.com/WasifurRahman/BERT_multimodal_transformer).
+2. Download the datasets to `./datasets` by running `download_datasets.sh`. For details, see the [multimodal transformer dataset guide](https://github.com/WasifurRahman/BERT_multimodal_transformer).
 
 3. Train the model on `MOSI` or `MOSEI` datasets using the `--dataset` flag:
+
    ```bash
    python train.py --dataset mosi   # For MOSI (default)
    python train.py --dataset mosei  # For MOSEI
@@ -33,6 +35,31 @@ Drawing on neurological models, the ITHP model employs the information bottlenec
 - Customize `train.py` for variable, loss function, or output modifications.
 - Reduce `max_seq_length` from the default `50` for memory efficiency.
 - Adjust `train_batch_size` to fit memory constraints.
+
+## Silver Span Supervision
+
+The recursive composer can consume an offline silver constituency cache and add a span-level auxiliary loss during training without changing the runtime model path.
+
+1. Install parser dependencies in a separate preprocessing environment, for example `benepar` and `nltk`, then download a parser model such as `benepar_en3`.
+2. Build a cache aligned with the existing dataset order:
+
+    ```bash
+    python scripts/build_silver_span_cache.py \
+       --dataset-path datasets/mosi.pkl \
+       --output-path datasets/mosi_silver_spans.pkl \
+       --parser-model benepar_en3
+    ```
+
+3. Train with span supervision enabled:
+
+    ```bash
+    python train.py \
+       --dataset mosi \
+       --silver_span_cache datasets/mosi_silver_spans.pkl \
+       --silver_span_loss_weight 0.1
+    ```
+
+If `--silver_span_cache` is omitted, training falls back to the original v11 behavior.
 
 ## Citation
 

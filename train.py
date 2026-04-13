@@ -47,6 +47,8 @@ parser.add_argument('--B0_dim', default=128, type=int)
 parser.add_argument('--B1_dim', default=64, type=int)
 parser.add_argument('--halting_threshold', default=0.0285, type=float)
 parser.add_argument('--acc7_loss_weight', default=0.2, type=float)
+parser.add_argument('--silver_span_cache', default='', type=str)
+parser.add_argument('--silver_span_loss_weight', default=0.1, type=float)
 parser.add_argument('--syntax_temperature', default=1.0, type=float)
 parser.add_argument('--merge_trace_samples', default=3, type=int)
 parser.add_argument('--max_grad_norm', default=1.0, type=float)
@@ -60,13 +62,14 @@ ACOUSTIC_DIM, VISUAL_DIM, TEXT_DIM = (global_configs.ACOUSTIC_DIM, global_config
 class InputFeatures(object):
     """A single set of features of data."""
 
-    def __init__(self, input_ids, visual, acoustic, input_mask, segment_ids, label_id):
+    def __init__(self, input_ids, visual, acoustic, input_mask, segment_ids, label_id, syntax_span_mask):
         self.input_ids = input_ids
         self.visual = visual
         self.acoustic = acoustic
         self.input_mask = input_mask
         self.segment_ids = segment_ids
         self.label_id = label_id
+        self.syntax_span_mask = syntax_span_mask
 
 
 def safe_min_max_normalize(tensor: torch.Tensor) -> torch.Tensor:
@@ -168,8 +171,113 @@ def build_readable_tree_views(tree_text, tokens):
     return span_tree, text_tree
 
 
-def convert_to_features(examples, max_seq_length, tokenizer):
+def resolve_silver_span_cache_path():
+    if args.silver_span_cache:
+        return args.silver_span_cache
+
+    default_cache_path = os.path.join("datasets", f"{args.dataset}_silver_spans.pkl")
+    if os.path.exists(default_cache_path):
+        return default_cache_path
+
+    return ""
+
+
+def load_silver_span_cache():
+    cache_path = resolve_silver_span_cache_path()
+    if not cache_path:
+        print("SILVER_SPAN_CACHE: disabled")
+        return None
+
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(f"Silver span cache not found: {cache_path}")
+
+    with open(cache_path, "rb") as handle:
+        cache = pickle.load(handle)
+
+    if not isinstance(cache, dict):
+        raise ValueError("Silver span cache must be a dict with train/dev/test splits")
+
+    missing_splits = [split_name for split_name in ("train", "dev", "test") if split_name not in cache]
+    if missing_splits:
+        raise ValueError(f"Silver span cache missing splits: {missing_splits}")
+
+    print(f"SILVER_SPAN_CACHE: loaded {cache_path}")
+    return cache
+
+
+def get_silver_span_record(split_records, example_index, words, segment):
+    if split_records is None:
+        return None
+
+    if isinstance(split_records, list):
+        if example_index >= len(split_records):
+            raise IndexError(
+                f"Silver span cache is shorter than dataset: idx={example_index}, cache_size={len(split_records)}"
+            )
+        record = split_records[example_index]
+    elif isinstance(split_records, dict):
+        record = split_records.get(segment)
+        if record is None:
+            record = split_records.get(str(example_index))
+    else:
+        raise TypeError("Silver span cache split must be either a list or a dict")
+
+    if record is None:
+        raise KeyError(f"Missing silver span record for segment={segment}, index={example_index}")
+
+    record_words = record.get("words") if isinstance(record, dict) else None
+    if record_words is not None and list(record_words) != list(words):
+        raise ValueError(f"Silver span cache word mismatch for segment={segment}, index={example_index}")
+
+    return record
+
+
+def build_silver_span_mask(silver_record, inversions, max_seq_length):
+    span_mask = np.zeros((max_seq_length, max_seq_length), dtype=np.float32)
+    if silver_record is None or len(inversions) == 0:
+        return span_mask
+
+    word_spans = silver_record.get("word_spans") or silver_record.get("spans") or []
+    if not word_spans:
+        return span_mask
+
+    word_to_token_start = {}
+    word_to_token_end = {}
+    for token_idx, word_idx in enumerate(inversions):
+        word_to_token_start.setdefault(word_idx, token_idx)
+        word_to_token_end[word_idx] = token_idx + 1
+
+    for word_start, word_end in word_spans:
+        word_start = int(word_start)
+        word_end = int(word_end)
+
+        if word_end - word_start < 2:
+            continue
+
+        if word_start not in word_to_token_start or (word_end - 1) not in word_to_token_end:
+            continue
+
+        token_start = word_to_token_start[word_start] + 1
+        token_end = word_to_token_end[word_end - 1] + 1
+
+        if token_end - token_start < 2:
+            continue
+
+        if token_start >= max_seq_length or token_end - 1 >= max_seq_length:
+            continue
+
+        span_mask[token_start, token_end - 1] = 1.0
+
+    return span_mask
+
+
+def convert_to_features(examples, max_seq_length, tokenizer, silver_records=None):
     features = []
+
+    if isinstance(silver_records, list) and len(silver_records) != len(examples):
+        raise ValueError(
+            f"Silver span cache size mismatch: dataset={len(examples)}, cache={len(silver_records)}"
+        )
 
     for (ex_index, example) in enumerate(examples):
 
@@ -197,8 +305,12 @@ def convert_to_features(examples, max_seq_length, tokenizer):
         # Truncate input if necessary
         if len(tokens) > max_seq_length - 2:
             tokens = tokens[: max_seq_length - 2]
+            inversions = inversions[: max_seq_length - 2]
             acoustic = acoustic[: max_seq_length - 2]
             visual = visual[: max_seq_length - 2]
+
+        silver_record = get_silver_span_record(silver_records, ex_index, words, segment) if silver_records is not None else None
+        syntax_span_mask = build_silver_span_mask(silver_record, inversions, max_seq_length)
 
         prepare_input = prepare_deberta_input
 
@@ -221,6 +333,7 @@ def convert_to_features(examples, max_seq_length, tokenizer):
                 visual=visual,
                 acoustic=acoustic,
                 label_id=label_id,
+                syntax_span_mask=syntax_span_mask,
             )
         )
     return features
@@ -263,20 +376,22 @@ def get_tokenizer(model):
     return DebertaV2Tokenizer.from_pretrained(model)
 
 
-def get_appropriate_dataset(data):
+def get_appropriate_dataset(data, silver_records=None):
     tokenizer = get_tokenizer(args.model)
 
-    features = convert_to_features(data, args.max_seq_length, tokenizer)
+    features = convert_to_features(data, args.max_seq_length, tokenizer, silver_records=silver_records)
     all_input_ids = torch.tensor(np.array([f.input_ids for f in features]), dtype=torch.long)
     all_visual = torch.tensor(np.array([f.visual for f in features]), dtype=torch.float)
     all_acoustic = torch.tensor(np.array([f.acoustic for f in features]), dtype=torch.float)
     all_label_ids = torch.tensor(np.array([f.label_id for f in features]), dtype=torch.float)
+    all_syntax_span_masks = torch.tensor(np.array([f.syntax_span_mask for f in features]), dtype=torch.float)
 
     dataset = TensorDataset(
         all_input_ids,
         all_visual,
         all_acoustic,
         all_label_ids,
+        all_syntax_span_masks,
     )
     return dataset
 
@@ -285,13 +400,24 @@ def set_up_data_loader():
     with open(f"datasets/{args.dataset}.pkl", "rb") as handle:
         data = pickle.load(handle)
 
+    silver_span_cache = load_silver_span_cache()
+
     train_data = data["train"]
     dev_data = data["dev"]
     test_data = data["test"]
 
-    train_dataset = get_appropriate_dataset(train_data)
-    dev_dataset = get_appropriate_dataset(dev_data)
-    test_dataset = get_appropriate_dataset(test_data)
+    train_dataset = get_appropriate_dataset(
+        train_data,
+        silver_records=silver_span_cache["train"] if silver_span_cache is not None else None,
+    )
+    dev_dataset = get_appropriate_dataset(
+        dev_data,
+        silver_records=silver_span_cache["dev"] if silver_span_cache is not None else None,
+    )
+    test_dataset = get_appropriate_dataset(
+        test_data,
+        silver_records=silver_span_cache["test"] if silver_span_cache is not None else None,
+    )
 
     num_train_optimization_steps = (
             int(
@@ -379,6 +505,7 @@ def prep_for_training(num_train_optimization_steps: int):
 def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, scheduler):
     model.train()
     tr_loss = 0
+    syntax_loss_total = 0.0
     recursion_steps_total = 0.0
     max_depth_hits = 0
     nb_tr_examples, nb_tr_steps = 0, 0
@@ -387,28 +514,35 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
     encountered_nonfinite = False
     for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
         batch = tuple(t.to(DEVICE) for t in batch)
-        input_ids, visual, acoustic, label_ids = batch
+        input_ids, visual, acoustic, label_ids, syntax_span_masks = batch
         visual = torch.squeeze(visual, 1)
         acoustic = torch.squeeze(acoustic, 1)
 
         visual_norm = safe_min_max_normalize(visual)
         acoustic_norm = safe_min_max_normalize(acoustic)
-        logits, acc7_logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps = model(
+        logits, acc7_logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps, syntax_loss = model(
             input_ids,
             visual_norm,
             acoustic_norm,
+            syntax_span_masks=syntax_span_masks,
         )
         regression_loss = regression_loss_fct(logits.view(-1), label_ids.view(-1))
         acc7_targets = build_acc7_targets(label_ids.view(-1))
         acc7_loss = acc7_loss_fct(acc7_logits.view(-1, 7), acc7_targets)
-        loss = regression_loss + args.acc7_loss_weight * acc7_loss + 2 / (args.p_beta + args.p_gamma) * IB_loss
+        loss = (
+            regression_loss
+            + args.acc7_loss_weight * acc7_loss
+            + args.silver_span_loss_weight * syntax_loss
+            + 2 / (args.p_beta + args.p_gamma) * IB_loss
+        )
 
         if not torch.isfinite(loss):
             print(
-                "NONFINITE_TRAIN: step:{}, regression_loss:{}, acc7_loss:{}, ib_loss:{}".format(
+                "NONFINITE_TRAIN: step:{}, regression_loss:{}, acc7_loss:{}, syntax_loss:{}, ib_loss:{}".format(
                     step + 1,
                     regression_loss.detach().item(),
                     acc7_loss.detach().item(),
+                    syntax_loss.detach().item(),
                     IB_loss.detach().item(),
                 )
             )
@@ -421,6 +555,7 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
         loss.backward()
 
         tr_loss += loss.item()
+        syntax_loss_total += syntax_loss.detach().item()
         recursion_steps_total += recursive_steps.float().sum().item()
         max_depth_hits += (recursive_steps == global_configs.MAX_RECURSION_DEPTH).sum().item()
         nb_tr_examples += recursive_steps.size(0)
@@ -433,14 +568,21 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
             optimizer.zero_grad()
 
     if nb_tr_steps == 0 or nb_tr_examples == 0:
-        return float("nan"), 0.0, 0.0, encountered_nonfinite
+        return float("nan"), 0.0, 0.0, 0.0, encountered_nonfinite
 
-    return tr_loss / nb_tr_steps, recursion_steps_total / nb_tr_examples, max_depth_hits / nb_tr_examples, encountered_nonfinite
+    return (
+        tr_loss / nb_tr_steps,
+        recursion_steps_total / nb_tr_examples,
+        max_depth_hits / nb_tr_examples,
+        syntax_loss_total / nb_tr_steps,
+        encountered_nonfinite,
+    )
 
 
 def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
     model.eval()
     dev_loss = 0
+    syntax_loss_total = 0.0
     recursion_steps_total = 0.0
     max_depth_hits = 0
     nb_dev_examples, nb_dev_steps = 0, 0
@@ -450,29 +592,31 @@ def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
     with torch.no_grad():
         for step, batch in enumerate(tqdm(dev_dataloader, desc="Iteration")):
             batch = tuple(t.to(DEVICE) for t in batch)
-            input_ids, visual, acoustic, label_ids = batch
+            input_ids, visual, acoustic, label_ids, syntax_span_masks = batch
             visual = torch.squeeze(visual, 1)
             acoustic = torch.squeeze(acoustic, 1)
 
             visual_norm = safe_min_max_normalize(visual)
             acoustic_norm = safe_min_max_normalize(acoustic)
 
-            logits, acc7_logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps = model(
+            logits, acc7_logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps, syntax_loss = model(
                 input_ids,
                 visual_norm,
                 acoustic_norm,
+                syntax_span_masks=syntax_span_masks,
             )
             regression_loss = regression_loss_fct(logits.view(-1), label_ids.view(-1))
             acc7_targets = build_acc7_targets(label_ids.view(-1))
             acc7_loss = acc7_loss_fct(acc7_logits.view(-1, 7), acc7_targets)
             loss = regression_loss + args.acc7_loss_weight * acc7_loss
 
-            if not torch.isfinite(loss):
+            if not torch.isfinite(loss) or not torch.isfinite(syntax_loss):
                 print(
-                    "NONFINITE_VALID: step:{}, regression_loss:{}, acc7_loss:{}".format(
+                    "NONFINITE_VALID: step:{}, regression_loss:{}, acc7_loss:{}, syntax_loss:{}".format(
                         step + 1,
                         regression_loss.detach().item(),
                         acc7_loss.detach().item(),
+                        syntax_loss.detach().item(),
                     )
                 )
                 encountered_nonfinite = True
@@ -482,15 +626,22 @@ def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
                 loss = loss / args.gradient_accumulation_step
 
             dev_loss += loss.item()
+            syntax_loss_total += syntax_loss.detach().item()
             recursion_steps_total += recursive_steps.float().sum().item()
             max_depth_hits += (recursive_steps == global_configs.MAX_RECURSION_DEPTH).sum().item()
             nb_dev_examples += recursive_steps.size(0)
             nb_dev_steps += 1
 
     if nb_dev_steps == 0 or nb_dev_examples == 0:
-        return float("nan"), 0.0, 0.0, encountered_nonfinite
+        return float("nan"), 0.0, 0.0, 0.0, encountered_nonfinite
 
-    return dev_loss / nb_dev_steps, recursion_steps_total / nb_dev_examples, max_depth_hits / nb_dev_examples, encountered_nonfinite
+    return (
+        dev_loss / nb_dev_steps,
+        recursion_steps_total / nb_dev_examples,
+        max_depth_hits / nb_dev_examples,
+        syntax_loss_total / nb_dev_steps,
+        encountered_nonfinite,
+    )
 
 
 def test_epoch(model: nn.Module, test_dataloader: DataLoader):
@@ -501,6 +652,8 @@ def test_epoch(model: nn.Module, test_dataloader: DataLoader):
     max_depth_hits = 0
     sample_count = 0
     syntax_samples = []
+    syntax_loss_total = 0.0
+    syntax_loss_batches = 0
     tokenizer = get_tokenizer(args.model) if args.merge_trace_samples > 0 else None
     pad_token_id = tokenizer.pad_token_id if tokenizer is not None and tokenizer.pad_token_id is not None else 0
 
@@ -508,7 +661,7 @@ def test_epoch(model: nn.Module, test_dataloader: DataLoader):
         for batch in tqdm(test_dataloader):
             batch = tuple(t.to(DEVICE) for t in batch)
 
-            input_ids, visual, acoustic, label_ids = batch
+            input_ids, visual, acoustic, label_ids, syntax_span_masks = batch
             visual = torch.squeeze(visual, 1)
             acoustic = torch.squeeze(acoustic, 1)
 
@@ -519,18 +672,21 @@ def test_epoch(model: nn.Module, test_dataloader: DataLoader):
                 input_ids,
                 visual_norm,
                 acoustic_norm,
+                syntax_span_masks=syntax_span_masks,
                 return_syntax_info=tokenizer is not None,
             )
 
             if tokenizer is not None:
-                logits, acc7_logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps, syntax_info = model_outputs
+                logits, acc7_logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps, syntax_loss, syntax_info = model_outputs
             else:
-                logits, acc7_logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps = model_outputs
+                logits, acc7_logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps, syntax_loss = model_outputs
                 syntax_info = None
 
             recursion_steps_total += recursive_steps.float().sum().item()
             max_depth_hits += (recursive_steps == global_configs.MAX_RECURSION_DEPTH).sum().item()
             sample_count += recursive_steps.size(0)
+            syntax_loss_total += syntax_loss.detach().item()
+            syntax_loss_batches += 1
 
             if syntax_info is not None and len(syntax_samples) < args.merge_trace_samples:
                 sample_logits = logits.view(-1).detach().cpu()
@@ -570,8 +726,9 @@ def test_epoch(model: nn.Module, test_dataloader: DataLoader):
 
     avg_recursion_steps = recursion_steps_total / sample_count if sample_count > 0 else 0.0
     max_depth_hit_rate = max_depth_hits / sample_count if sample_count > 0 else 0.0
+    avg_syntax_loss = syntax_loss_total / syntax_loss_batches if syntax_loss_batches > 0 else 0.0
 
-    return preds, labels, avg_recursion_steps, max_depth_hit_rate, syntax_samples
+    return preds, labels, avg_recursion_steps, max_depth_hit_rate, syntax_samples, avg_syntax_loss
 
 
 def build_acc7_targets(labels):
@@ -610,7 +767,7 @@ def print_merge_trace_samples(syntax_samples):
 
 
 def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero=False, return_acc7=False):
-    preds, y_test, avg_recursion_steps, max_depth_hit_rate, syntax_samples = test_epoch(model, test_dataloader)
+    preds, y_test, avg_recursion_steps, max_depth_hit_rate, syntax_samples, avg_syntax_loss = test_epoch(model, test_dataloader)
     acc7 = acc7_score(preds, y_test)
     non_zeros = np.array(
         [i for i, e in enumerate(y_test) if e != 0 or use_zero])
@@ -628,9 +785,9 @@ def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero=Fal
     acc = accuracy_score(y_test, preds)
 
     if return_acc7:
-        return acc, acc7, mae, corr, f_score, avg_recursion_steps, max_depth_hit_rate, syntax_samples
+        return acc, acc7, mae, corr, f_score, avg_recursion_steps, max_depth_hit_rate, syntax_samples, avg_syntax_loss
 
-    return acc, mae, corr, f_score, avg_recursion_steps, max_depth_hit_rate, syntax_samples
+    return acc, mae, corr, f_score, avg_recursion_steps, max_depth_hit_rate, syntax_samples, avg_syntax_loss
 
 
 def train(
@@ -654,10 +811,16 @@ def train(
     best_valid_avg_steps = None
     best_train_hit_rate = None
     best_valid_hit_rate = None
+    best_train_syntax_loss = None
+    best_valid_syntax_loss = None
 
     for epoch_i in range(int(args.n_epochs)):
-        train_loss, train_avg_steps, train_hit_rate, train_nonfinite = train_epoch(model, train_dataloader, optimizer, scheduler)
-        valid_loss, valid_avg_steps, valid_hit_rate, valid_nonfinite = eval_epoch(model, validation_dataloader)
+        train_loss, train_avg_steps, train_hit_rate, train_syntax_loss, train_nonfinite = train_epoch(
+            model, train_dataloader, optimizer, scheduler
+        )
+        valid_loss, valid_avg_steps, valid_hit_rate, valid_syntax_loss, valid_nonfinite = eval_epoch(
+            model, validation_dataloader
+        )
 
         if valid_loss < best_valid_loss:
             best_valid_loss = valid_loss
@@ -668,10 +831,20 @@ def train(
             best_valid_avg_steps = valid_avg_steps
             best_train_hit_rate = train_hit_rate
             best_valid_hit_rate = valid_hit_rate
+            best_train_syntax_loss = train_syntax_loss
+            best_valid_syntax_loss = valid_syntax_loss
 
         print(
-            "TRAIN: epoch:{}, train_loss:{}, valid_loss:{}, train_avg_steps:{}, valid_avg_steps:{}, train_hit_max_depth_rate:{}, valid_hit_max_depth_rate:{}".format(
-                epoch_i + 1, train_loss, valid_loss, train_avg_steps, valid_avg_steps, train_hit_rate, valid_hit_rate
+            "TRAIN: epoch:{}, train_loss:{}, valid_loss:{}, train_syntax_loss:{}, valid_syntax_loss:{}, train_avg_steps:{}, valid_avg_steps:{}, train_hit_max_depth_rate:{}, valid_hit_max_depth_rate:{}".format(
+                epoch_i + 1,
+                train_loss,
+                valid_loss,
+                train_syntax_loss,
+                valid_syntax_loss,
+                train_avg_steps,
+                valid_avg_steps,
+                train_hit_rate,
+                valid_hit_rate,
             )
         )
 
@@ -682,14 +855,28 @@ def train(
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
 
-    test_acc, test_acc7, test_mae, test_corr, test_f_score, test_avg_steps, test_hit_rate, syntax_samples = test_score_model(
+    test_acc, test_acc7, test_mae, test_corr, test_f_score, test_avg_steps, test_hit_rate, syntax_samples, test_syntax_loss = test_score_model(
         model, test_data_loader, return_acc7=True
     )
     print(
-        "TEST: best_epoch:{}, train_loss:{}, valid_loss:{}, train_avg_steps:{}, valid_avg_steps:{}, train_hit_max_depth_rate:{}, valid_hit_max_depth_rate:{}, test_acc:{}, acc7:{}, mae:{}, corr:{}, f1_score:{}, test_avg_steps:{}, test_hit_max_depth_rate:{}".format(
-            best_epoch, best_train_loss, best_valid_loss, best_train_avg_steps, best_valid_avg_steps,
-            best_train_hit_rate, best_valid_hit_rate, test_acc, test_acc7, test_mae, test_corr, test_f_score,
-            test_avg_steps, test_hit_rate
+        "TEST: best_epoch:{}, train_loss:{}, valid_loss:{}, train_syntax_loss:{}, valid_syntax_loss:{}, train_avg_steps:{}, valid_avg_steps:{}, train_hit_max_depth_rate:{}, valid_hit_max_depth_rate:{}, test_acc:{}, acc7:{}, mae:{}, corr:{}, f1_score:{}, test_avg_steps:{}, test_hit_max_depth_rate:{}, test_syntax_loss:{}".format(
+            best_epoch,
+            best_train_loss,
+            best_valid_loss,
+            best_train_syntax_loss,
+            best_valid_syntax_loss,
+            best_train_avg_steps,
+            best_valid_avg_steps,
+            best_train_hit_rate,
+            best_valid_hit_rate,
+            test_acc,
+            test_acc7,
+            test_mae,
+            test_corr,
+            test_f_score,
+            test_avg_steps,
+            test_hit_rate,
+            test_syntax_loss,
         )
     )
     print_merge_trace_samples(syntax_samples)
