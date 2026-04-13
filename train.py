@@ -3,6 +3,7 @@ import os
 import random
 import pickle
 import numpy as np
+import copy
 
 from sklearn.metrics import accuracy_score, f1_score
 
@@ -11,7 +12,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-from torch.nn import MSELoss
+from torch.nn import MSELoss, CrossEntropyLoss
 
 from transformers import get_linear_schedule_with_warmup, DebertaV2Tokenizer
 from torch.optim import AdamW
@@ -21,7 +22,7 @@ import global_configs
 from global_configs import DEVICE
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--model", type=str, default="microsoft/deberta-v3-base", )
+parser.add_argument("--model", type=str, default="/root/autodl-tmp/recursive_language/deberta-v3-base", )
 parser.add_argument("--dataset", type=str,
                     choices=["mosi", "mosei"], default="mosi")
 parser.add_argument("--max_seq_length", type=int, default=50)
@@ -42,8 +43,10 @@ parser.add_argument('--p_beta', default=8, help='coefficient -- beta', type=floa
 parser.add_argument('--p_gamma', default=32, help='coefficient -- gamma', type=float)
 parser.add_argument('--beta_shift', default=1.0, help='coefficient -- shift', type=float)
 parser.add_argument('--IB_coef', default=10, type=float)
-parser.add_argument('--B0_dim', default=128, type=float)
-parser.add_argument('--B1_dim', default=64, type=float)
+parser.add_argument('--B0_dim', default=128, type=int)
+parser.add_argument('--B1_dim', default=64, type=int)
+parser.add_argument('--halting_threshold', default=0.0285, type=float)
+parser.add_argument('--acc7_loss_weight', default=0.2, type=float)
 
 args = parser.parse_args()
 
@@ -274,7 +277,11 @@ def prep_for_training(num_train_optimization_steps: int):
 def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, scheduler):
     model.train()
     tr_loss = 0
+    recursion_steps_total = 0.0
+    max_depth_hits = 0
     nb_tr_examples, nb_tr_steps = 0, 0
+    regression_loss_fct = MSELoss()
+    acc7_loss_fct = CrossEntropyLoss()
     for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
         batch = tuple(t.to(DEVICE) for t in batch)
         input_ids, visual, acoustic, label_ids = batch
@@ -283,13 +290,15 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
 
         visual_norm = (visual - visual.min()) / (visual.max() - visual.min())
         acoustic_norm = (acoustic - acoustic.min()) / (acoustic.max() - acoustic.min())
-        logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1 = model(
+        logits, acc7_logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps = model(
             input_ids,
             visual_norm,
             acoustic_norm,
         )
-        loss_fct = MSELoss()
-        loss = loss_fct(logits.view(-1), label_ids.view(-1)) + 2 / (args.p_beta + args.p_gamma) * IB_loss
+        regression_loss = regression_loss_fct(logits.view(-1), label_ids.view(-1))
+        acc7_targets = build_acc7_targets(label_ids.view(-1))
+        acc7_loss = acc7_loss_fct(acc7_logits.view(-1, 7), acc7_targets)
+        loss = regression_loss + args.acc7_loss_weight * acc7_loss + 2 / (args.p_beta + args.p_gamma) * IB_loss
 
         if args.gradient_accumulation_step > 1:
             loss = loss / args.gradient_accumulation_step
@@ -297,6 +306,9 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
         loss.backward()
 
         tr_loss += loss.item()
+        recursion_steps_total += recursive_steps.float().sum().item()
+        max_depth_hits += (recursive_steps == global_configs.MAX_RECURSION_DEPTH).sum().item()
+        nb_tr_examples += recursive_steps.size(0)
         nb_tr_steps += 1
 
         if (step + 1) % args.gradient_accumulation_step == 0:
@@ -304,13 +316,17 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
             scheduler.step()
             optimizer.zero_grad()
 
-    return tr_loss / nb_tr_steps
+    return tr_loss / nb_tr_steps, recursion_steps_total / nb_tr_examples, max_depth_hits / nb_tr_examples
 
 
 def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
     model.eval()
     dev_loss = 0
+    recursion_steps_total = 0.0
+    max_depth_hits = 0
     nb_dev_examples, nb_dev_steps = 0, 0
+    regression_loss_fct = MSELoss()
+    acc7_loss_fct = CrossEntropyLoss()
     with torch.no_grad():
         for step, batch in enumerate(tqdm(dev_dataloader, desc="Iteration")):
             batch = tuple(t.to(DEVICE) for t in batch)
@@ -321,27 +337,35 @@ def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
             visual_norm = (visual - visual.min()) / (visual.max() - visual.min())
             acoustic_norm = (acoustic - acoustic.min()) / (acoustic.max() - acoustic.min())
 
-            logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1 = model(
+            logits, acc7_logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps = model(
                 input_ids,
                 visual_norm,
                 acoustic_norm,
             )
-            loss_fct = MSELoss()
-            loss = loss_fct(logits.view(-1), label_ids.view(-1))
+            regression_loss = regression_loss_fct(logits.view(-1), label_ids.view(-1))
+            acc7_targets = build_acc7_targets(label_ids.view(-1))
+            acc7_loss = acc7_loss_fct(acc7_logits.view(-1, 7), acc7_targets)
+            loss = regression_loss + args.acc7_loss_weight * acc7_loss
 
             if args.gradient_accumulation_step > 1:
                 loss = loss / args.gradient_accumulation_step
 
             dev_loss += loss.item()
+            recursion_steps_total += recursive_steps.float().sum().item()
+            max_depth_hits += (recursive_steps == global_configs.MAX_RECURSION_DEPTH).sum().item()
+            nb_dev_examples += recursive_steps.size(0)
             nb_dev_steps += 1
 
-    return dev_loss / nb_dev_steps
+    return dev_loss / nb_dev_steps, recursion_steps_total / nb_dev_examples, max_depth_hits / nb_dev_examples
 
 
 def test_epoch(model: nn.Module, test_dataloader: DataLoader):
     model.eval()
     preds = []
     labels = []
+    recursion_steps_total = 0.0
+    max_depth_hits = 0
+    sample_count = 0
 
     with torch.no_grad():
         for batch in tqdm(test_dataloader):
@@ -354,11 +378,15 @@ def test_epoch(model: nn.Module, test_dataloader: DataLoader):
             visual_norm = (visual - visual.min()) / (visual.max() - visual.min())
             acoustic_norm = (acoustic - acoustic.min()) / (acoustic.max() - acoustic.min())
 
-            logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1 = model(
+            logits, acc7_logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps = model(
                 input_ids,
                 visual_norm,
                 acoustic_norm,
             )
+
+            recursion_steps_total += recursive_steps.float().sum().item()
+            max_depth_hits += (recursive_steps == global_configs.MAX_RECURSION_DEPTH).sum().item()
+            sample_count += recursive_steps.size(0)
 
             logits = logits.detach().cpu().numpy()
             label_ids = label_ids.detach().cpu().numpy()
@@ -372,11 +400,33 @@ def test_epoch(model: nn.Module, test_dataloader: DataLoader):
         preds = np.array(preds)
         labels = np.array(labels)
 
-    return preds, labels
+    avg_recursion_steps = recursion_steps_total / sample_count if sample_count > 0 else 0.0
+    max_depth_hit_rate = max_depth_hits / sample_count if sample_count > 0 else 0.0
+
+    return preds, labels, avg_recursion_steps, max_depth_hit_rate
 
 
-def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero=False):
-    preds, y_test = test_epoch(model, test_dataloader)
+def build_acc7_targets(labels):
+    return torch.clamp(torch.round(labels), -3, 3).long() + 3
+
+
+def multiclass_acc(preds, labels):
+    preds = np.asarray(preds)
+    labels = np.asarray(labels)
+
+    if preds.size == 0:
+        return 0.0
+
+    return np.mean(np.round(preds) == np.round(labels))
+
+
+def acc7_score(preds, labels):
+    return multiclass_acc(np.clip(preds, -3.0, 3.0), np.clip(labels, -3.0, 3.0))
+
+
+def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero=False, return_acc7=False):
+    preds, y_test, avg_recursion_steps, max_depth_hit_rate = test_epoch(model, test_dataloader)
+    acc7 = acc7_score(preds, y_test)
     non_zeros = np.array(
         [i for i, e in enumerate(y_test) if e != 0 or use_zero])
 
@@ -392,7 +442,10 @@ def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero=Fal
     f_score = f1_score(y_test, preds, average="weighted")
     acc = accuracy_score(y_test, preds)
 
-    return acc, mae, corr, f_score
+    if return_acc7:
+        return acc, acc7, mae, corr, f_score, avg_recursion_steps, max_depth_hit_rate
+
+    return acc, mae, corr, f_score, avg_recursion_steps, max_depth_hit_rate
 
 
 def train(
@@ -408,26 +461,49 @@ def train(
     mae_list = []
     corr_list = []
     f1_list = []
-    for epoch_i in range(int(args.n_epochs)):
-        train_loss = train_epoch(model, train_dataloader, optimizer, scheduler)
-        valid_loss = eval_epoch(model, validation_dataloader)
+    best_valid_loss = float("inf")
+    best_epoch = -1
+    best_train_loss = None
+    best_state_dict = None
+    best_train_avg_steps = None
+    best_valid_avg_steps = None
+    best_train_hit_rate = None
+    best_valid_hit_rate = None
 
-        if epoch_i != args.n_epochs - 1:
-            print(
-                "TRAIN: epoch:{}, train_loss:{}, valid_loss:{}".format(
-                    epoch_i + 1, train_loss, valid_loss
-                )
+    for epoch_i in range(int(args.n_epochs)):
+        train_loss, train_avg_steps, train_hit_rate = train_epoch(model, train_dataloader, optimizer, scheduler)
+        valid_loss, valid_avg_steps, valid_hit_rate = eval_epoch(model, validation_dataloader)
+
+        if valid_loss < best_valid_loss:
+            best_valid_loss = valid_loss
+            best_epoch = epoch_i + 1
+            best_train_loss = train_loss
+            best_state_dict = copy.deepcopy(model.state_dict())
+            best_train_avg_steps = train_avg_steps
+            best_valid_avg_steps = valid_avg_steps
+            best_train_hit_rate = train_hit_rate
+            best_valid_hit_rate = valid_hit_rate
+
+        print(
+            "TRAIN: epoch:{}, train_loss:{}, valid_loss:{}, train_avg_steps:{}, valid_avg_steps:{}, train_hit_max_depth_rate:{}, valid_hit_max_depth_rate:{}".format(
+                epoch_i + 1, train_loss, valid_loss, train_avg_steps, valid_avg_steps, train_hit_rate, valid_hit_rate
             )
-        else:
-            test_acc, test_mae, test_corr, test_f_score = test_score_model(
-                model, test_data_loader
-            )
-            print(
-                "TEST: train_loss:{}, valid_loss:{}, test_acc:{}, mae:{}, corr:{}, f1_score:{}".format(
-                    train_loss, valid_loss, test_acc, test_mae, test_corr, test_f_score
-                )
-            )
-    return train_loss, valid_loss, test_acc, test_mae, test_corr, test_f_score
+        )
+
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+
+    test_acc, test_acc7, test_mae, test_corr, test_f_score, test_avg_steps, test_hit_rate = test_score_model(
+        model, test_data_loader, return_acc7=True
+    )
+    print(
+        "TEST: best_epoch:{}, train_loss:{}, valid_loss:{}, train_avg_steps:{}, valid_avg_steps:{}, train_hit_max_depth_rate:{}, valid_hit_max_depth_rate:{}, test_acc:{}, acc7:{}, mae:{}, corr:{}, f1_score:{}, test_avg_steps:{}, test_hit_max_depth_rate:{}".format(
+            best_epoch, best_train_loss, best_valid_loss, best_train_avg_steps, best_valid_avg_steps,
+            best_train_hit_rate, best_valid_hit_rate, test_acc, test_acc7, test_mae, test_corr, test_f_score,
+            test_avg_steps, test_hit_rate
+        )
+    )
+    return best_train_loss, best_valid_loss, test_acc, test_mae, test_corr, test_f_score
 
 
 def main():

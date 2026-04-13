@@ -6,6 +6,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 TEXT_DIM = 0
 ACOUSTIC_DIM = 0
 VISUAL_DIM = 0
+MAX_RECURSION_DEPTH = 3
 DEVICE = torch.device("cuda:0")
 
 def set_dataset_config(dataset_name):
