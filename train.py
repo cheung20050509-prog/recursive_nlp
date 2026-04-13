@@ -76,6 +76,98 @@ def safe_min_max_normalize(tensor: torch.Tensor) -> torch.Tensor:
     return (tensor - tensor_min) / tensor_range
 
 
+TREE_SPECIAL_TOKENS = {"[CLS]", "[SEP]", "[PAD]", "[MASK]"}
+CONTRACTION_SUFFIXES = {"s", "t", "re", "ve", "m", "ll", "d"}
+
+
+def render_token_phrase(tokens, include_special_tokens=False):
+    words = []
+    current_word = ""
+
+    for token in tokens:
+        if token in TREE_SPECIAL_TOKENS:
+            if current_word:
+                words.append(current_word)
+                current_word = ""
+            if include_special_tokens:
+                words.append(token)
+            continue
+
+        if token.startswith("▁"):
+            if current_word:
+                words.append(current_word)
+            current_word = token[1:]
+            continue
+
+        if not current_word:
+            current_word = token
+            continue
+
+        if token in CONTRACTION_SUFFIXES and current_word[-1].isalnum():
+            current_word = current_word + "'" + token
+        else:
+            current_word = current_word + token
+
+    if current_word:
+        words.append(current_word)
+
+    if not words and not include_special_tokens:
+        return render_token_phrase(tokens, include_special_tokens=True)
+
+    return " ".join(words)
+
+
+def parse_syntax_tree(tree_text):
+    if tree_text is None:
+        return None
+
+    tree_tokens = tree_text.replace("(", " ( ").replace(")", " ) ").split()
+    if not tree_tokens:
+        return None
+
+    def parse_node(cursor):
+        token = tree_tokens[cursor]
+        if token != "(":
+            return int(token), cursor + 1
+
+        left_node, cursor = parse_node(cursor + 1)
+        right_node, cursor = parse_node(cursor)
+        if tree_tokens[cursor] != ")":
+            raise ValueError("Malformed syntax tree: missing closing parenthesis")
+        return (left_node, right_node), cursor + 1
+
+    syntax_tree, next_cursor = parse_node(0)
+    if next_cursor != len(tree_tokens):
+        raise ValueError("Malformed syntax tree: trailing tokens remain after parse")
+    return syntax_tree
+
+
+def build_readable_tree_views(tree_text, tokens):
+    syntax_tree = parse_syntax_tree(tree_text)
+    if syntax_tree is None or not tokens:
+        return None, None
+
+    def render_node(node):
+        if isinstance(node, int):
+            start = node
+            end = node + 1
+            span_tree = f"[{start}:{end}]"
+            text_tree = render_token_phrase(tokens[start:end], include_special_tokens=True)
+            return start, end, span_tree, text_tree
+
+        left_start, left_end, left_span_tree, left_text_tree = render_node(node[0])
+        right_start, right_end, right_span_tree, right_text_tree = render_node(node[1])
+        start = left_start
+        end = right_end
+        span_tree = f"([{start}:{end}] {left_span_tree} {right_span_tree})"
+        phrase_text = render_token_phrase(tokens[start:end], include_special_tokens=False)
+        text_tree = f"({phrase_text}: {left_text_tree} {right_text_tree})"
+        return start, end, span_tree, text_tree
+
+    _, _, span_tree, text_tree = render_node(syntax_tree)
+    return span_tree, text_tree
+
+
 def convert_to_features(examples, max_seq_length, tokenizer):
     features = []
 
@@ -448,12 +540,20 @@ def test_epoch(model: nn.Module, test_dataloader: DataLoader):
 
                 for sample_idx in range(min(remaining_slots, sample_input_ids.size(0))):
                     valid_ids = sample_input_ids[sample_idx][sample_input_ids[sample_idx].ne(pad_token_id)].tolist()
+                    token_list = tokenizer.convert_ids_to_tokens(valid_ids)
+                    span_tree, text_tree = build_readable_tree_views(
+                        syntax_info["syntax_trees"][sample_idx],
+                        token_list,
+                    )
                     syntax_samples.append({
                         "prediction": float(sample_logits[sample_idx].item()),
                         "label": float(sample_labels[sample_idx].item()),
-                        "tokens": tokenizer.convert_ids_to_tokens(valid_ids),
+                        "tokens": token_list,
+                        "sentence": render_token_phrase(token_list, include_special_tokens=False),
                         "merge_trace": syntax_info["merge_traces"][sample_idx],
                         "syntax_tree": syntax_info["syntax_trees"][sample_idx],
+                        "span_tree": span_tree,
+                        "text_tree": text_tree,
                     })
 
             logits = logits.detach().cpu().numpy()
@@ -495,15 +595,18 @@ def acc7_score(preds, labels):
 def print_merge_trace_samples(syntax_samples):
     for sample_idx, sample in enumerate(syntax_samples, start=1):
         print(
-            "MERGE_TRACE[{}]: pred:{:.4f}, label:{:.4f}, trace:{}, tree:{}, tokens:{}".format(
+            "MERGE_TRACE[{}]: pred:{:.4f}, label:{:.4f}, trace:{}, tree:{}".format(
                 sample_idx,
                 sample["prediction"],
                 sample["label"],
                 sample["merge_trace"],
                 sample["syntax_tree"],
-                " ".join(sample["tokens"]),
             )
         )
+        print("MERGE_TRACE_SPAN[{}]: {}".format(sample_idx, sample["span_tree"]))
+        print("MERGE_TRACE_TEXT[{}]: {}".format(sample_idx, sample["text_tree"]))
+        print("MERGE_TRACE_TOKENS[{}]: {}".format(sample_idx, " ".join(sample["tokens"])))
+        print("MERGE_TRACE_SENTENCE[{}]: {}".format(sample_idx, sample["sentence"]))
 
 
 def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero=False, return_acc7=False):
