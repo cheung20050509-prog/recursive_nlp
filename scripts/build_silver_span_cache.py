@@ -1,4 +1,5 @@
 import argparse
+import os
 import pickle
 from pathlib import Path
 
@@ -10,10 +11,19 @@ def parse_args():
     parser.add_argument("--dataset-path", required=True, type=str)
     parser.add_argument("--output-path", required=True, type=str)
     parser.add_argument("--parser-model", default="benepar_en3", type=str)
+    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"], type=str)
     parser.add_argument("--download-model", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--limit", default=0, type=int)
     return parser.parse_args()
+
+
+def configure_runtime(device):
+    # benepar pulls in transformers/sentencepiece; this avoids the protobuf incompatibility
+    # we hit in the environment while keeping cache generation deterministic.
+    os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+    if device == "cpu":
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 
 def load_parser(model_name, download_model=False):
@@ -98,8 +108,31 @@ def build_split_cache(split_name, examples, benepar_module, parser, limit=0):
     return split_cache
 
 
+def summarize_split_cache(split_name, split_cache):
+    total = len(split_cache)
+    nonempty = sum(1 for record in split_cache if record.get("word_spans"))
+    parse_errors = sum(1 for record in split_cache if record.get("parse_error"))
+    print(
+        f"CACHE_SUMMARY[{split_name}]: total={total}, nonempty={nonempty}, parse_errors={parse_errors}"
+    )
+
+    if total > 0 and nonempty == 0 and parse_errors > 0:
+        first_error = next(record["parse_error"] for record in split_cache if record.get("parse_error"))
+        raise RuntimeError(
+            f"Silver span generation failed for split '{split_name}': all parsed spans are empty. "
+            f"First parse error: {first_error}"
+        )
+
+    return {
+        "total": total,
+        "nonempty": nonempty,
+        "parse_errors": parse_errors,
+    }
+
+
 def main():
     args = parse_args()
+    configure_runtime(args.device)
     output_path = Path(args.output_path)
     if output_path.exists() and not args.overwrite:
         raise FileExistsError(f"Output already exists: {output_path}")
@@ -113,15 +146,27 @@ def main():
 
     benepar_module, parser = load_parser(args.parser_model, download_model=args.download_model)
 
+    train_cache = build_split_cache("train", data["train"], benepar_module, parser, limit=args.limit)
+    dev_cache = build_split_cache("dev", data["dev"], benepar_module, parser, limit=args.limit)
+    test_cache = build_split_cache("test", data["test"], benepar_module, parser, limit=args.limit)
+
+    summary = {
+        "train": summarize_split_cache("train", train_cache),
+        "dev": summarize_split_cache("dev", dev_cache),
+        "test": summarize_split_cache("test", test_cache),
+    }
+
     cache = {
         "meta": {
             "dataset_path": args.dataset_path,
             "parser_model": args.parser_model,
+            "device": args.device,
             "limit": args.limit,
+            "summary": summary,
         },
-        "train": build_split_cache("train", data["train"], benepar_module, parser, limit=args.limit),
-        "dev": build_split_cache("dev", data["dev"], benepar_module, parser, limit=args.limit),
-        "test": build_split_cache("test", data["test"], benepar_module, parser, limit=args.limit),
+        "train": train_cache,
+        "dev": dev_cache,
+        "test": test_cache,
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

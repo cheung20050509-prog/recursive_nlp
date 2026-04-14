@@ -201,6 +201,22 @@ def load_silver_span_cache():
     if missing_splits:
         raise ValueError(f"Silver span cache missing splits: {missing_splits}")
 
+    for split_name in ("train", "dev", "test"):
+        split_records = cache[split_name]
+        if isinstance(split_records, dict):
+            split_records = list(split_records.values())
+
+        nonempty = sum(1 for record in split_records if record.get("word_spans") or record.get("spans"))
+        parse_errors = sum(1 for record in split_records if record.get("parse_error"))
+        print(
+            f"SILVER_SPAN_CACHE[{split_name}]: total={len(split_records)}, nonempty={nonempty}, parse_errors={parse_errors}"
+        )
+        if len(split_records) > 0 and nonempty == 0 and parse_errors > 0:
+            raise ValueError(
+                f"Silver span cache '{cache_path}' has no usable spans for split '{split_name}'. "
+                "Regenerate the cache before training."
+            )
+
     print(f"SILVER_SPAN_CACHE: loaded {cache_path}")
     return cache
 
@@ -749,6 +765,20 @@ def acc7_score(preds, labels):
     return multiclass_acc(np.clip(preds, -3.0, 3.0), np.clip(labels, -3.0, 3.0))
 
 
+def safe_corrcoef(preds, labels):
+    preds = np.asarray(preds)
+    labels = np.asarray(labels)
+
+    if preds.size < 2 or labels.size < 2:
+        return 0.0
+
+    corr = np.corrcoef(preds, labels)[0][1]
+    if np.isnan(corr):
+        return 0.0
+
+    return float(corr)
+
+
 def print_merge_trace_samples(syntax_samples):
     for sample_idx, sample in enumerate(syntax_samples, start=1):
         print(
@@ -768,26 +798,45 @@ def print_merge_trace_samples(syntax_samples):
 
 def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero=False, return_acc7=False):
     preds, y_test, avg_recursion_steps, max_depth_hit_rate, syntax_samples, avg_syntax_loss = test_epoch(model, test_dataloader)
-    acc7 = acc7_score(preds, y_test)
-    non_zeros = np.array(
-        [i for i, e in enumerate(y_test) if e != 0 or use_zero])
+    non_zeros = np.array([index for index, label in enumerate(y_test) if label != 0 or use_zero])
 
-    preds = preds[non_zeros]
-    y_test = y_test[non_zeros]
+    preds_a7 = np.clip(preds, a_min=-3.0, a_max=3.0)
+    labels_a7 = np.clip(y_test, a_min=-3.0, a_max=3.0)
+    acc7 = multiclass_acc(preds_a7, labels_a7)
 
-    mae = np.mean(np.absolute(preds - y_test))
-    corr = np.corrcoef(preds, y_test)[0][1]
+    mae = float(np.mean(np.absolute(preds - y_test)))
+    corr = safe_corrcoef(preds, y_test)
 
-    preds = preds >= 0
-    y_test = y_test >= 0
+    preds_zero = preds >= 0
+    labels_zero = y_test >= 0
+    f1_score_zero = f1_score(labels_zero, preds_zero, average="weighted")
+    acc2_zero = accuracy_score(labels_zero, preds_zero)
 
-    f_score = f1_score(y_test, preds, average="weighted")
-    acc = accuracy_score(y_test, preds)
+    preds_no_zero = preds[non_zeros]
+    labels_no_zero = y_test[non_zeros]
+    if preds_no_zero.size == 0:
+        acc2_no_zero = 0.0
+        f1_score_no_zero = 0.0
+    else:
+        preds_no_zero = preds_no_zero > 0
+        labels_no_zero = labels_no_zero > 0
+        f1_score_no_zero = f1_score(labels_no_zero, preds_no_zero, average="weighted")
+        acc2_no_zero = accuracy_score(labels_no_zero, preds_no_zero)
+
+    metrics = {
+        "acc7": float(acc7),
+        "acc2_zero": float(acc2_zero),
+        "f1_score_zero": float(f1_score_zero),
+        "acc2_no_zero": float(acc2_no_zero),
+        "f1_score_no_zero": float(f1_score_no_zero),
+        "mae": mae,
+        "corr": corr,
+    }
 
     if return_acc7:
-        return acc, acc7, mae, corr, f_score, avg_recursion_steps, max_depth_hit_rate, syntax_samples, avg_syntax_loss
+        return metrics, avg_recursion_steps, max_depth_hit_rate, syntax_samples, avg_syntax_loss
 
-    return acc, mae, corr, f_score, avg_recursion_steps, max_depth_hit_rate, syntax_samples, avg_syntax_loss
+    return metrics, avg_recursion_steps, max_depth_hit_rate, syntax_samples, avg_syntax_loss
 
 
 def train(
@@ -855,11 +904,11 @@ def train(
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
 
-    test_acc, test_acc7, test_mae, test_corr, test_f_score, test_avg_steps, test_hit_rate, syntax_samples, test_syntax_loss = test_score_model(
+    test_metrics, test_avg_steps, test_hit_rate, syntax_samples, test_syntax_loss = test_score_model(
         model, test_data_loader, return_acc7=True
     )
     print(
-        "TEST: best_epoch:{}, train_loss:{}, valid_loss:{}, train_syntax_loss:{}, valid_syntax_loss:{}, train_avg_steps:{}, valid_avg_steps:{}, train_hit_max_depth_rate:{}, valid_hit_max_depth_rate:{}, test_acc:{}, acc7:{}, mae:{}, corr:{}, f1_score:{}, test_avg_steps:{}, test_hit_max_depth_rate:{}, test_syntax_loss:{}".format(
+        "TEST: best_epoch:{}, train_loss:{}, valid_loss:{}, train_syntax_loss:{}, valid_syntax_loss:{}, train_avg_steps:{}, valid_avg_steps:{}, train_hit_max_depth_rate:{}, valid_hit_max_depth_rate:{}, test_acc:{}, acc7:{}, acc2_zero:{}, f1_score_zero:{}, acc2_no_zero:{}, f1_score_no_zero:{}, mae:{}, corr:{}, f1_score:{}, test_avg_steps:{}, test_hit_max_depth_rate:{}, test_syntax_loss:{}".format(
             best_epoch,
             best_train_loss,
             best_valid_loss,
@@ -869,18 +918,29 @@ def train(
             best_valid_avg_steps,
             best_train_hit_rate,
             best_valid_hit_rate,
-            test_acc,
-            test_acc7,
-            test_mae,
-            test_corr,
-            test_f_score,
+            test_metrics["acc2_no_zero"],
+            test_metrics["acc7"],
+            test_metrics["acc2_zero"],
+            test_metrics["f1_score_zero"],
+            test_metrics["acc2_no_zero"],
+            test_metrics["f1_score_no_zero"],
+            test_metrics["mae"],
+            test_metrics["corr"],
+            test_metrics["f1_score_no_zero"],
             test_avg_steps,
             test_hit_rate,
             test_syntax_loss,
         )
     )
     print_merge_trace_samples(syntax_samples)
-    return best_train_loss, best_valid_loss, test_acc, test_mae, test_corr, test_f_score
+    return (
+        best_train_loss,
+        best_valid_loss,
+        test_metrics["acc2_no_zero"],
+        test_metrics["mae"],
+        test_metrics["corr"],
+        test_metrics["f1_score_no_zero"],
+    )
 
 
 def main():

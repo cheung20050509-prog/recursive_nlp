@@ -1,7 +1,8 @@
 import os
 import torch
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 TEXT_DIM = 0
 ACOUSTIC_DIM = 0
