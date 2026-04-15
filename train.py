@@ -45,6 +45,7 @@ parser.add_argument('--beta_shift', default=1.0, help='coefficient -- shift', ty
 parser.add_argument('--IB_coef', default=10, type=float)
 parser.add_argument('--B0_dim', default=128, type=int)
 parser.add_argument('--B1_dim', default=64, type=int)
+parser.add_argument('--max_recursion_depth', default=3, type=int)
 parser.add_argument('--halting_threshold', default=0.0285, type=float)
 parser.add_argument('--acc7_loss_weight', default=0.2, type=float)
 parser.add_argument('--silver_span_cache', default='', type=str)
@@ -52,8 +53,18 @@ parser.add_argument('--silver_span_loss_weight', default=0.1, type=float)
 parser.add_argument('--syntax_temperature', default=1.0, type=float)
 parser.add_argument('--merge_trace_samples', default=3, type=int)
 parser.add_argument('--max_grad_norm', default=1.0, type=float)
+parser.add_argument('--selection_metric', default='valid_loss', choices=['valid_loss', 'mae'], type=str)
+parser.add_argument('--early_stopping_patience', default=0, type=int)
 
 args = parser.parse_args()
+
+if args.max_recursion_depth < 1:
+    raise ValueError('max_recursion_depth must be at least 1')
+
+if args.early_stopping_patience < 0:
+    raise ValueError('early_stopping_patience must be non-negative')
+
+global_configs.MAX_RECURSION_DEPTH = args.max_recursion_depth
 
 global_configs.set_dataset_config(args.dataset)
 ACOUSTIC_DIM, VISUAL_DIM, TEXT_DIM = (global_configs.ACOUSTIC_DIM, global_configs.VISUAL_DIM,
@@ -598,6 +609,8 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
 def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
     model.eval()
     dev_loss = 0
+    preds = []
+    labels = []
     syntax_loss_total = 0.0
     recursion_steps_total = 0.0
     max_depth_hits = 0
@@ -648,8 +661,19 @@ def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
             nb_dev_examples += recursive_steps.size(0)
             nb_dev_steps += 1
 
+            logits = logits.detach().cpu().numpy()
+            label_ids = label_ids.detach().cpu().numpy()
+
+            logits = np.squeeze(logits).tolist()
+            label_ids = np.squeeze(label_ids).tolist()
+
+            preds.extend(logits)
+            labels.extend(label_ids)
+
     if nb_dev_steps == 0 or nb_dev_examples == 0:
-        return float("nan"), 0.0, 0.0, 0.0, encountered_nonfinite
+        return float("nan"), 0.0, 0.0, 0.0, encountered_nonfinite, None
+
+    valid_metrics = compute_sentiment_metrics(np.array(preds), np.array(labels))
 
     return (
         dev_loss / nb_dev_steps,
@@ -657,6 +681,7 @@ def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
         max_depth_hits / nb_dev_examples,
         syntax_loss_total / nb_dev_steps,
         encountered_nonfinite,
+        valid_metrics,
     )
 
 
@@ -779,6 +804,45 @@ def safe_corrcoef(preds, labels):
     return float(corr)
 
 
+def compute_sentiment_metrics(preds, labels, use_zero=False):
+    preds = np.asarray(preds)
+    labels = np.asarray(labels)
+    non_zeros = np.array([index for index, label in enumerate(labels) if label != 0 or use_zero])
+
+    preds_a7 = np.clip(preds, a_min=-3.0, a_max=3.0)
+    labels_a7 = np.clip(labels, a_min=-3.0, a_max=3.0)
+    acc7 = multiclass_acc(preds_a7, labels_a7)
+
+    mae = float(np.mean(np.absolute(preds - labels)))
+    corr = safe_corrcoef(preds, labels)
+
+    preds_zero = preds >= 0
+    labels_zero = labels >= 0
+    f1_score_zero = f1_score(labels_zero, preds_zero, average="weighted")
+    acc2_zero = accuracy_score(labels_zero, preds_zero)
+
+    preds_no_zero = preds[non_zeros]
+    labels_no_zero = labels[non_zeros]
+    if preds_no_zero.size == 0:
+        acc2_no_zero = 0.0
+        f1_score_no_zero = 0.0
+    else:
+        preds_no_zero = preds_no_zero > 0
+        labels_no_zero = labels_no_zero > 0
+        f1_score_no_zero = f1_score(labels_no_zero, preds_no_zero, average="weighted")
+        acc2_no_zero = accuracy_score(labels_no_zero, preds_no_zero)
+
+    return {
+        "acc7": float(acc7),
+        "acc2_zero": float(acc2_zero),
+        "f1_score_zero": float(f1_score_zero),
+        "acc2_no_zero": float(acc2_no_zero),
+        "f1_score_no_zero": float(f1_score_no_zero),
+        "mae": mae,
+        "corr": corr,
+    }
+
+
 def print_merge_trace_samples(syntax_samples):
     for sample_idx, sample in enumerate(syntax_samples, start=1):
         print(
@@ -798,40 +862,7 @@ def print_merge_trace_samples(syntax_samples):
 
 def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero=False, return_acc7=False):
     preds, y_test, avg_recursion_steps, max_depth_hit_rate, syntax_samples, avg_syntax_loss = test_epoch(model, test_dataloader)
-    non_zeros = np.array([index for index, label in enumerate(y_test) if label != 0 or use_zero])
-
-    preds_a7 = np.clip(preds, a_min=-3.0, a_max=3.0)
-    labels_a7 = np.clip(y_test, a_min=-3.0, a_max=3.0)
-    acc7 = multiclass_acc(preds_a7, labels_a7)
-
-    mae = float(np.mean(np.absolute(preds - y_test)))
-    corr = safe_corrcoef(preds, y_test)
-
-    preds_zero = preds >= 0
-    labels_zero = y_test >= 0
-    f1_score_zero = f1_score(labels_zero, preds_zero, average="weighted")
-    acc2_zero = accuracy_score(labels_zero, preds_zero)
-
-    preds_no_zero = preds[non_zeros]
-    labels_no_zero = y_test[non_zeros]
-    if preds_no_zero.size == 0:
-        acc2_no_zero = 0.0
-        f1_score_no_zero = 0.0
-    else:
-        preds_no_zero = preds_no_zero > 0
-        labels_no_zero = labels_no_zero > 0
-        f1_score_no_zero = f1_score(labels_no_zero, preds_no_zero, average="weighted")
-        acc2_no_zero = accuracy_score(labels_no_zero, preds_no_zero)
-
-    metrics = {
-        "acc7": float(acc7),
-        "acc2_zero": float(acc2_zero),
-        "f1_score_zero": float(f1_score_zero),
-        "acc2_no_zero": float(acc2_no_zero),
-        "f1_score_no_zero": float(f1_score_no_zero),
-        "mae": mae,
-        "corr": corr,
-    }
+    metrics = compute_sentiment_metrics(preds, y_test, use_zero=use_zero)
 
     if return_acc7:
         return metrics, avg_recursion_steps, max_depth_hit_rate, syntax_samples, avg_syntax_loss
@@ -853,6 +884,8 @@ def train(
     corr_list = []
     f1_list = []
     best_valid_loss = float("inf")
+    best_selection_score = float("inf")
+    best_valid_metrics = None
     best_epoch = -1
     best_train_loss = None
     best_state_dict = None
@@ -862,17 +895,22 @@ def train(
     best_valid_hit_rate = None
     best_train_syntax_loss = None
     best_valid_syntax_loss = None
+    epochs_without_improvement = 0
 
     for epoch_i in range(int(args.n_epochs)):
         train_loss, train_avg_steps, train_hit_rate, train_syntax_loss, train_nonfinite = train_epoch(
             model, train_dataloader, optimizer, scheduler
         )
-        valid_loss, valid_avg_steps, valid_hit_rate, valid_syntax_loss, valid_nonfinite = eval_epoch(
+        valid_loss, valid_avg_steps, valid_hit_rate, valid_syntax_loss, valid_nonfinite, valid_metrics = eval_epoch(
             model, validation_dataloader
         )
 
-        if valid_loss < best_valid_loss:
+        selection_score = valid_loss if args.selection_metric == "valid_loss" else valid_metrics["mae"]
+
+        if selection_score < best_selection_score:
+            best_selection_score = selection_score
             best_valid_loss = valid_loss
+            best_valid_metrics = valid_metrics
             best_epoch = epoch_i + 1
             best_train_loss = train_loss
             best_state_dict = copy.deepcopy(model.state_dict())
@@ -882,12 +920,19 @@ def train(
             best_valid_hit_rate = valid_hit_rate
             best_train_syntax_loss = train_syntax_loss
             best_valid_syntax_loss = valid_syntax_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
 
         print(
-            "TRAIN: epoch:{}, train_loss:{}, valid_loss:{}, train_syntax_loss:{}, valid_syntax_loss:{}, train_avg_steps:{}, valid_avg_steps:{}, train_hit_max_depth_rate:{}, valid_hit_max_depth_rate:{}".format(
+            "TRAIN: epoch:{}, train_loss:{}, valid_loss:{}, valid_mae:{}, valid_corr:{}, selection_metric:{}, selection_score:{}, train_syntax_loss:{}, valid_syntax_loss:{}, train_avg_steps:{}, valid_avg_steps:{}, train_hit_max_depth_rate:{}, valid_hit_max_depth_rate:{}".format(
                 epoch_i + 1,
                 train_loss,
                 valid_loss,
+                valid_metrics["mae"],
+                valid_metrics["corr"],
+                args.selection_metric,
+                selection_score,
                 train_syntax_loss,
                 valid_syntax_loss,
                 train_avg_steps,
@@ -901,6 +946,18 @@ def train(
             print("EARLY_STOP: non-finite loss encountered at epoch:{}".format(epoch_i + 1))
             break
 
+        if args.early_stopping_patience > 0 and epochs_without_improvement >= args.early_stopping_patience:
+            print(
+                "EARLY_STOP: patience exhausted at epoch:{}, best_epoch:{}, selection_metric:{}, best_selection_score:{}, patience:{}".format(
+                    epoch_i + 1,
+                    best_epoch,
+                    args.selection_metric,
+                    best_selection_score,
+                    args.early_stopping_patience,
+                )
+            )
+            break
+
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
 
@@ -908,10 +965,14 @@ def train(
         model, test_data_loader, return_acc7=True
     )
     print(
-        "TEST: best_epoch:{}, train_loss:{}, valid_loss:{}, train_syntax_loss:{}, valid_syntax_loss:{}, train_avg_steps:{}, valid_avg_steps:{}, train_hit_max_depth_rate:{}, valid_hit_max_depth_rate:{}, test_acc:{}, acc7:{}, acc2_zero:{}, f1_score_zero:{}, acc2_no_zero:{}, f1_score_no_zero:{}, mae:{}, corr:{}, f1_score:{}, test_avg_steps:{}, test_hit_max_depth_rate:{}, test_syntax_loss:{}".format(
+        "TEST: best_epoch:{}, selection_metric:{}, selection_score:{}, train_loss:{}, valid_loss:{}, valid_mae:{}, valid_corr:{}, train_syntax_loss:{}, valid_syntax_loss:{}, train_avg_steps:{}, valid_avg_steps:{}, train_hit_max_depth_rate:{}, valid_hit_max_depth_rate:{}, test_acc:{}, acc7:{}, acc2_zero:{}, f1_score_zero:{}, acc2_no_zero:{}, f1_score_no_zero:{}, mae:{}, corr:{}, f1_score:{}, test_avg_steps:{}, test_hit_max_depth_rate:{}, test_syntax_loss:{}".format(
             best_epoch,
+            args.selection_metric,
+            best_selection_score,
             best_train_loss,
             best_valid_loss,
+            best_valid_metrics["mae"] if best_valid_metrics is not None else float("nan"),
+            best_valid_metrics["corr"] if best_valid_metrics is not None else float("nan"),
             best_train_syntax_loss,
             best_valid_syntax_loss,
             best_train_avg_steps,

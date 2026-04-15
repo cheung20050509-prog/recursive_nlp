@@ -23,6 +23,8 @@ SEARCH_SPACE = {
     "p_gamma": [16, 32, 64],
     "B0_dim": [64, 128, 256],
     "B1_dim": [32, 64, 128],
+    "max_recursion_depth": [3, 4, 5],
+    "halting_threshold": [0.02, 0.0285, 0.04, 0.06],
     "dropout_prob": [0.3, 0.5],
     "silver_span_loss_weight": [0.05, 0.1, 0.2],
     "syntax_temperature": [0.5, 1.0, 2.0],
@@ -44,13 +46,19 @@ METRIC_ALIASES = {
     "f1_score_no_zero": ["f1_score_no_zero", "f1_score"],
 }
 
+def default_n_epochs(dataset):
+    return 10 if dataset == "mosei" else 20
+
+def default_early_stopping_patience(dataset):
+    return 3 if dataset == "mosei" else 0
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True, choices=["mosi", "mosei"])
     parser.add_argument("--gpu", required=True, type=int)
     parser.add_argument("--n_trials", default=20, type=int)
-    parser.add_argument("--n_epochs", default=20, type=int)
+    parser.add_argument("--n_epochs", default=None, type=int)
     parser.add_argument("--seed", default=128, type=int)
     parser.add_argument("--output_dir", default="search_results", type=str)
     parser.add_argument(
@@ -59,8 +67,20 @@ def parse_args():
         choices=sorted(METRIC_DIRECTIONS.keys()),
         help="Metric used to rank trials",
     )
+    parser.add_argument(
+        "--selection_metric",
+        default="valid_loss",
+        choices=["valid_loss", "mae"],
+        help="Metric used for checkpoint selection and early stopping",
+    )
+    parser.add_argument("--early_stopping_patience", default=None, type=int)
     parser.add_argument("--resume", action="store_true", help="Skip already-completed trials")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.n_epochs is None:
+        args.n_epochs = default_n_epochs(args.dataset)
+    if args.early_stopping_patience is None:
+        args.early_stopping_patience = default_early_stopping_patience(args.dataset)
+    return args
 
 
 def sample_configs(n_trials, seed):
@@ -75,13 +95,15 @@ def sample_configs(n_trials, seed):
 PYTHON = "/root/autodl-tmp/anaconda3/envs/ITHP5090/bin/python"
 
 
-def build_train_command(dataset, config, n_epochs, trial_log_path):
+def build_train_command(dataset, config, n_epochs, selection_metric, early_stopping_patience, trial_log_path):
     cmd = [
         PYTHON, "-u", "train.py",
         "--dataset", dataset,
         "--n_epochs", str(n_epochs),
         "--silver_span_cache", f"datasets/{dataset}_silver_spans.pkl",
         "--merge_trace_samples", "0",
+        "--selection_metric", selection_metric,
+        "--early_stopping_patience", str(early_stopping_patience),
     ]
     for key, value in config.items():
         cmd.extend([f"--{key}", str(value)])
@@ -167,6 +189,9 @@ def main():
     print(f"=== Random Search: {args.dataset}, {args.n_trials} trials, GPU {args.gpu} ===")
     print(f"Output: {output_dir}")
     print(f"Primary metric: {args.primary_metric} ({METRIC_DIRECTIONS[args.primary_metric]})")
+    print(f"Selection metric: {args.selection_metric}")
+    print(f"Epochs per trial: {args.n_epochs}")
+    print(f"Early stopping patience: {args.early_stopping_patience}")
     print(f"Search space size: {' x '.join(str(len(v)) for v in SEARCH_SPACE.values())} = "
           f"{sum(1 for _ in itertools.product(*SEARCH_SPACE.values()))} total combinations")
     print()
@@ -177,7 +202,14 @@ def main():
             continue
 
         trial_log = output_dir / f"trial_{trial_idx:03d}.log"
-        cmd = build_train_command(args.dataset, config, args.n_epochs, trial_log)
+        cmd = build_train_command(
+            args.dataset,
+            config,
+            args.n_epochs,
+            args.selection_metric,
+            args.early_stopping_patience,
+            trial_log,
+        )
 
         print(f"[Trial {trial_idx}] Config: {config}")
         print(f"[Trial {trial_idx}] Log: {trial_log}")
