@@ -13,11 +13,16 @@ Phase 2:
 import argparse
 import json
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
 
 import optuna
+
+
+GRACEFUL_STOP_REQUESTED = False
+GRACEFUL_STOP_SIGNAL = None
 
 
 SEARCH_SPACE = {
@@ -95,6 +100,40 @@ METRIC_ALIASES = {
 }
 
 PYTHON = "/root/autodl-tmp/anaconda3/envs/ITHP5090/bin/python"
+
+
+def _signal_name(signum):
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return str(signum)
+
+
+def request_graceful_stop(signum, _frame):
+    global GRACEFUL_STOP_REQUESTED, GRACEFUL_STOP_SIGNAL
+    GRACEFUL_STOP_REQUESTED = True
+    GRACEFUL_STOP_SIGNAL = _signal_name(signum)
+    print(
+        f"GRACEFUL_STOP: received {GRACEFUL_STOP_SIGNAL}; the current trial will finish before the search stops.",
+        flush=True,
+    )
+
+
+def install_signal_handlers():
+    for signum in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
+        if signum is not None:
+            signal.signal(signum, request_graceful_stop)
+
+
+def maybe_stop_study_after_trial(study, trial):
+    if not GRACEFUL_STOP_REQUESTED:
+        return
+
+    print(
+        f"GRACEFUL_STOP: trial {trial.number} finished; stopping before the next trial.",
+        flush=True,
+    )
+    study.stop()
 
 
 def default_n_epochs(dataset):
@@ -259,9 +298,13 @@ def build_train_command(dataset, config, n_epochs, selection_metric, early_stopp
     return command
 
 
-def suggest_config(trial, search_space):
+def suggest_config(trial, search_space, phase_name):
+    # Optuna fixes categorical distributions per parameter name within a study.
+    # local_tpe narrows the search space, so it must use namespaced parameter
+    # names while still returning the original training config keys.
+    param_prefix = "local_tpe__" if phase_name == "local_tpe" else ""
     return {
-        name: trial.suggest_categorical(name, choices)
+        name: trial.suggest_categorical(f"{param_prefix}{name}", choices)
         for name, choices in search_space.items()
     }
 
@@ -519,7 +562,7 @@ def find_duplicate_completed_trial(study, config):
 
 
 def run_trial(trial, study, args, phase_name, search_space, work_dir, output_dir):
-    config = normalize_config(suggest_config(trial, search_space))
+    config = normalize_config(suggest_config(trial, search_space, phase_name))
     duplicate_trial = find_duplicate_completed_trial(study, config)
 
     trial.set_user_attr("phase", phase_name)
@@ -623,9 +666,20 @@ def run_phase(
     print(f"=== Phase {phase_name}: completed={completed}, remaining={remaining} ===")
     if remaining == 0:
         return study
+    if GRACEFUL_STOP_REQUESTED:
+        print(
+            f"=== Phase {phase_name}: graceful stop already requested; skipping {remaining} pending trials ===",
+            flush=True,
+        )
+        return study
 
     objective = lambda trial: run_trial(trial, study, args, phase_name, search_space, work_dir, output_dir)
-    study.optimize(objective, n_trials=remaining, catch=(RuntimeError,))
+    study.optimize(
+        objective,
+        n_trials=remaining,
+        catch=(RuntimeError,),
+        callbacks=[maybe_stop_study_after_trial],
+    )
     write_artifacts(
         study,
         output_dir,
@@ -639,6 +693,7 @@ def run_phase(
 
 
 def main():
+    install_signal_handlers()
     args = parse_args()
     work_dir = Path(__file__).resolve().parent.parent
     os.chdir(work_dir)

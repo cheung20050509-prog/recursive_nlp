@@ -12,9 +12,11 @@ class ITHP_DebertaModel(DebertaV2PreTrainedModel):
         super().__init__(config)
         TEXT_DIM, ACOUSTIC_DIM, VISUAL_DIM = (global_configs.TEXT_DIM, global_configs.ACOUSTIC_DIM,
                                               global_configs.VISUAL_DIM)
+        hcf_dim = int(getattr(multimodal_config, 'hcf_dim', 4))
         self.config = config
         self.pooler = BertPooler(config)
-        model = DebertaV2Model.from_pretrained("/root/autodl-tmp/recursive_language/deberta-v3-base")
+        backbone_path = getattr(multimodal_config, 'model', None) or "/root/autodl-tmp/recursive_nlp/deberta-v3-base"
+        model = DebertaV2Model.from_pretrained(backbone_path)
         self.model = model.to(DEVICE)
         ITHP_args = {
             'X0_dim': TEXT_DIM,
@@ -38,6 +40,19 @@ class ITHP_DebertaModel(DebertaV2PreTrainedModel):
         )
         self.LayerNorm = nn.LayerNorm(config.hidden_size)
         self.dropout = nn.Dropout(multimodal_config.dropout_prob)
+        self.hcf_projector = nn.Sequential(
+            nn.Linear(hcf_dim, config.hidden_size),
+            nn.GELU(),
+            nn.Dropout(multimodal_config.dropout_prob),
+            nn.Linear(config.hidden_size, config.hidden_size),
+        )
+        self.hcf_fusion_gate = nn.Sequential(
+            nn.Linear(config.hidden_size * 2, config.hidden_size),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.Sigmoid(),
+        )
+        self.hcf_fusion_norm = nn.LayerNorm(config.hidden_size)
         self.syntax_composer = nn.Sequential(
             nn.Linear(config.hidden_size * 2, config.hidden_size),
             nn.GELU(),
@@ -197,6 +212,7 @@ class ITHP_DebertaModel(DebertaV2PreTrainedModel):
             input_ids,
             visual,
             acoustic,
+            hcf=None,
             syntax_span_masks=None,
             return_syntax_info=False,
     ):
@@ -211,6 +227,11 @@ class ITHP_DebertaModel(DebertaV2PreTrainedModel):
         sequence_output = self.dropout(
             self.LayerNorm(acoustic_vis_embedding + x)
         )
+        if hcf is not None:
+            hcf_hidden = self.hcf_projector(hcf)
+            hcf_hidden = hcf_hidden * attention_mask.unsqueeze(-1).to(dtype=hcf_hidden.dtype)
+            hcf_gate = self.hcf_fusion_gate(torch.cat([sequence_output, hcf_hidden], dim=-1))
+            sequence_output = self.hcf_fusion_norm(sequence_output + hcf_gate * hcf_hidden)
         pooled_output = self.pooler(sequence_output)
         syntax_root, merge_traces, syntax_trees, syntax_loss = self._recursive_compose(
             sequence_output,
@@ -249,6 +270,7 @@ class ITHP_DeBertaForSequenceClassification(DebertaV2PreTrainedModel):
             input_ids,
             visual,
             acoustic,
+            hcf=None,
             syntax_span_masks=None,
             return_syntax_info=False,
     ):
@@ -256,6 +278,7 @@ class ITHP_DeBertaForSequenceClassification(DebertaV2PreTrainedModel):
             input_ids,
             visual,
             acoustic,
+            hcf=hcf,
             syntax_span_masks=syntax_span_masks,
             return_syntax_info=return_syntax_info,
         )
@@ -277,3 +300,44 @@ class ITHP_DeBertaForSequenceClassification(DebertaV2PreTrainedModel):
             return logits, acc7_logits, IB_total, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps, syntax_loss, syntax_info
 
         return logits, acc7_logits, IB_total, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps, syntax_loss
+
+
+class ITHP_DeBertaForBinaryClassification(DebertaV2PreTrainedModel):
+    def __init__(self, config, multimodal_config):
+        super().__init__(config)
+        self.dberta = ITHP_DebertaModel(config, multimodal_config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.classifier = nn.Linear(config.hidden_size, 1)
+
+        self.init_weights()
+
+    def forward(
+            self,
+            input_ids,
+            visual,
+            acoustic,
+            hcf=None,
+            syntax_span_masks=None,
+            return_syntax_info=False,
+    ):
+        dberta_outputs = self.dberta(
+            input_ids,
+            visual,
+            acoustic,
+            hcf=hcf,
+            syntax_span_masks=syntax_span_masks,
+            return_syntax_info=return_syntax_info,
+        )
+
+        if return_syntax_info:
+            pooled_output, IB_total, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps, syntax_loss, syntax_info = dberta_outputs
+        else:
+            pooled_output, IB_total, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps, syntax_loss = dberta_outputs
+
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+
+        if return_syntax_info:
+            return logits, IB_total, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps, syntax_loss, syntax_info
+
+        return logits, IB_total, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps, syntax_loss

@@ -1,0 +1,21 @@
+{
+  "description": "MOSEI test MAE ~0.503 from full TPE run; recovered from Optuna parent log (not from train.py trial log).",
+  "source_log": "optuna_mosei_mae_gpu3.log",
+  "source_lines": "[tpe][Trial 117] Config / Optuna Trial 117 finished ... parameters:",
+  "study_name": "ithp_mosei_mae",
+  "trial_number": 117,
+  "log_path": "optuna_results_mae/mosei/trial_logs/tpe/trial_0117.log",
+  "test_mae": 0.502972846089703,
+  "config": {
+    "learning_rate": 5e-06,
+    "p_beta": 4,
+    "p_gamma": 16,
+    "B0_dim": 64,
+    "B1_dim": 64,
+    "max_recursion_depth": 4,
+    "halting_threshold": 0.0285,
+    "dropout_prob": 0.3,
+    "silver_span_loss_weight": 0.2,
+    "syntax_temperature": 0.5
+  }
+}
