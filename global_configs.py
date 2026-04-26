@@ -4,6 +4,7 @@ import torch
 if "CUDA_VISIBLE_DEVICES" not in os.environ:
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+# Text sequence hidden size: 768 for both DeBERTa-v3-base and ALBERT-base (HKT)
 TEXT_DIM = 0
 ACOUSTIC_DIM = 0
 VISUAL_DIM = 0

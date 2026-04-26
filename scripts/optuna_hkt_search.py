@@ -145,6 +145,24 @@ def parse_args():
             "mix with existing runs that used the ITHP-default processing."
         ),
     )
+    parser.add_argument(
+        "--hkt_paper_style",
+        action="store_true",
+        help="Forward --hkt_paper_style to every trial (60+36, z-score, HCF, binary F1). Incompatible with --github_style.",
+    )
+    parser.add_argument(
+        "--base_model",
+        type=str,
+        default=None,
+        help="If set, forwards --model to train_hkt_binary (e.g. path to albert-base-v2).",
+    )
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="auto",
+        choices=["auto", "albert", "deberta"],
+        help="Forwarded to train_hkt_binary --backbone when not 'auto'.",
+    )
     args = parser.parse_args()
 
     # Normalise dataset aliases the same way train_hkt_binary.py does.
@@ -159,6 +177,8 @@ def parse_args():
         args.early_stopping_patience = default_early_stopping(args.dataset)
     if args.dataset == "urfunny" and args.fold is not None:
         raise SystemExit("--fold is only meaningful for dataset=mustard")
+    if args.github_style and args.hkt_paper_style:
+        raise SystemExit("Use either --github_style or --hkt_paper_style, not both")
     return args
 
 
@@ -211,6 +231,12 @@ def build_train_command(args, config, run_name):
         command.extend(["--fold", str(args.fold if args.fold is not None else -1)])
     if getattr(args, "github_style", False):
         command.append("--github_style")
+    if getattr(args, "hkt_paper_style", False):
+        command.append("--hkt_paper_style")
+    if getattr(args, "base_model", None):
+        command.extend(["--model", str(args.base_model)])
+    if getattr(args, "backbone", "auto") != "auto":
+        command.extend(["--backbone", str(args.backbone)])
     for key, value in config.items():
         command.extend([f"--{key}", str(value)])
     return command

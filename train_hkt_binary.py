@@ -1,16 +1,16 @@
 """HKT-style binary classification trainer for MUStARD and UR-FUNNY.
 
-The pipeline is a ground-up rewrite over the legacy ``sibling`` version; it
-fixes several real bugs:
+- **Text backbone:** ``--backbone {auto,albert,deberta}``; ``--model`` may point
+  to ``albert-base-v2`` (Recursive **ITHP** + ALBERT) or DeBERTa (default path).
+- **HKT paper data/metrics (matalvepu):** ``--hkt_paper_style`` = 60+36 feature
+  subset, train z-score, HCF on, binary F1; mutually exclusive with ``--github_style``.
+- **F1:** ``--primary_f1 {binary,weighted}``; ``f1_hkt_paper`` in JSON mirrors
+  sklearn binary F1 (comparable to README Accuracy / F-score columns).
 
-- HCF (4-dim Humor-Centric Features) now flow through ``ITHP_DeBerta`` instead
-  of being silently dropped before the tensor dataset.
-- Per-dimension z-score normalisation for visual/acoustic (and HCF) fit on
-  train only, then applied to dev/test; replaces the old batch-wise min-max.
-- F1 metric switched to ``average="binary"`` (HKT-style).
-- Model selection defaults to ``accuracy`` (``--selection_metric``).
-- CLI exposes ``--fold`` for MUStARD speaker-independent k-fold CV and writes
-  a structured ``result.json`` per run under ``--output_dir``.
+HCF (4-dim Humor-Centric Features) flows through the multimodal encoder. Per
+dimension z-score (unless ``--skip_normalize``). Model selection via
+``--selection_metric``; ``--fold`` for MUStARD k-fold. Writes ``result.json`` per
+run.
 
 GitHub-style MHD/MSD compatibility knobs (match ``My_creation@MHD_MSD_optuna``
 ``data_humor.py`` + ``train_classify.py`` processing; disabled by default):
@@ -56,9 +56,16 @@ from torch.nn import BCEWithLogitsLoss
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
-from transformers import DebertaV2Tokenizer, get_linear_schedule_with_warmup
+from transformers import (
+    AlbertConfig,
+    AutoConfig,
+    AutoTokenizer,
+    DebertaV2Tokenizer,
+    get_linear_schedule_with_warmup,
+)
 
 from deberta_ITHP import ITHP_DeBertaForBinaryClassification
+from albert_ITHP import ITHP_AlbertForBinaryClassification
 import global_configs
 from global_configs import DEVICE
 from hkt_data import (
@@ -158,16 +165,42 @@ def parse_args():
             "MHD_MSD_optuna data processing 1:1."
         ),
     )
+    parser.add_argument(
+        "--hkt_paper_style",
+        action="store_true",
+        help=(
+            "Align with matalvepu/HKT data protocol: 60+36 feature subset, train-fitted z-score, "
+            "HCF on, binary F1 as primary. Mutually exclusive with --github_style."
+        ),
+    )
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="auto",
+        choices=["auto", "deberta", "albert"],
+        help=(
+            "Text encoder: 'albert' uses ITHP_AlbertForBinaryClassification + ALBERT; "
+            "'deberta' uses DeBERTa. 'auto' uses AutoConfig on --model to pick."
+        ),
+    )
     parser.add_argument("--output_dir", type=str, default="log/4080_restart_hkt")
     parser.add_argument("--run_name", type=str, default="",
                         help="Optional subdirectory under output_dir; defaults to <dataset>[_fold_k].")
     args = parser.parse_args()
 
+    if args.github_style and args.hkt_paper_style:
+        raise ValueError("Use either --github_style or --hkt_paper_style, not both")
     if args.github_style:
         args.feature_dim_mode = "full"
         args.skip_normalize = True
         args.primary_f1 = "weighted"
         args.disable_hcf = True
+    if args.hkt_paper_style:
+        # matalvepu HKT: subset features, HCF, z-score (train only); binary F1 like README F-score
+        args.feature_dim_mode = "subset"
+        args.skip_normalize = False
+        args.primary_f1 = "binary"
+        args.disable_hcf = False
 
     args.dataset = normalize_dataset_name(args.dataset)
     if args.max_seq_length <= 0:
@@ -182,7 +215,36 @@ def parse_args():
         raise ValueError("hcf_dim must be >= 1")
     if args.fold >= 0 and args.dataset != "mustard":
         raise ValueError("--fold is only meaningful for dataset=mustard")
+    args.resolved_backbone = _resolve_backbone_name(args)
     return args
+
+
+def _resolve_backbone_name(args):
+    if args.backbone in ("albert", "deberta"):
+        return args.backbone
+    try:
+        cfg = AutoConfig.from_pretrained(args.model, local_files_only=True)
+        model_type = getattr(cfg, "model_type", None)
+        if model_type == "albert":
+            return "albert"
+        if model_type in ("deberta", "deberta-v2"):
+            return "deberta"
+    except OSError:
+        try:
+            cfg = AutoConfig.from_pretrained(args.model, local_files_only=False)
+            model_type = getattr(cfg, "model_type", None)
+            if model_type == "albert":
+                return "albert"
+            if model_type in ("deberta", "deberta-v2"):
+                return "deberta"
+        except Exception:
+            pass
+    except Exception:
+        pass
+    p = (args.model or "").lower()
+    if "albert" in p:
+        return "albert"
+    return "deberta"
 
 
 args = parse_args()
@@ -424,7 +486,10 @@ def set_up_data_loader():
         fold=fold,
         dev_ratio=args.dev_ratio,
     )
-    tokenizer = DebertaV2Tokenizer.from_pretrained(args.model)
+    if args.resolved_backbone == "albert":
+        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    else:
+        tokenizer = DebertaV2Tokenizer.from_pretrained(args.model)
 
     train_examples = maybe_limit_examples(split_payload["train"])
     dev_examples = maybe_limit_examples(split_payload["dev"])
@@ -444,14 +509,17 @@ def set_up_data_loader():
         flush=True,
     )
     print(
-        "HKT_PROCESSING_STYLE: feature_dim_mode={} skip_normalize={} primary_f1={} "
-        "disable_hcf={} hcf_dim={} github_style={} dims=(acoustic={},visual={})".format(
+        "HKT_PROCESSING_STYLE: backbone={} feature_dim_mode={} skip_normalize={} primary_f1={} "
+        "disable_hcf={} hcf_dim={} github_style={} hkt_paper_style={} "
+        "dims=(acoustic={},visual={})".format(
+            args.resolved_backbone,
             args.feature_dim_mode,
             bool(args.skip_normalize),
             args.primary_f1,
             bool(args.disable_hcf),
             args.hcf_dim,
             bool(args.github_style),
+            bool(getattr(args, "hkt_paper_style", False)),
             ACOUSTIC_DIM,
             VISUAL_DIM,
         ),
@@ -493,11 +561,20 @@ def set_up_data_loader():
 
 
 def prep_for_training(num_train_optimization_steps: int):
-    model = ITHP_DeBertaForBinaryClassification.from_pretrained(
-        args.model,
-        multimodal_config=args,
-        num_labels=1,
-    )
+    if args.resolved_backbone == "albert":
+        # Composite model: do not use PreTrainedModel.from_pretrained (key prefix mismatch); the
+        # inner ITHP_AlbertModel already runs ``AlbertModel.from_pretrained`` in __init__.
+        try:
+            albert_cfg = AlbertConfig.from_pretrained(args.model, local_files_only=True)
+        except OSError:
+            albert_cfg = AlbertConfig.from_pretrained(args.model, local_files_only=False)
+        model = ITHP_AlbertForBinaryClassification(albert_cfg, args)
+    else:
+        model = ITHP_DeBertaForBinaryClassification.from_pretrained(
+            args.model,
+            multimodal_config=args,
+            num_labels=1,
+        )
     model.to(DEVICE)
 
     param_optimizer = list(model.named_parameters())
@@ -531,6 +608,7 @@ def compute_binary_metrics(probabilities, labels):
         "f1": f1_weighted if args.primary_f1 == "weighted" else f1_binary,
         "f1_binary": f1_binary,
         "f1_weighted": f1_weighted,
+        "f1_hkt_paper": f1_binary,
     }
 
 
@@ -705,12 +783,20 @@ def main():
     )
 
     cli_snapshot = {
-        key: value for key, value in vars(args).items() if isinstance(value, (int, float, str, bool, list))
+        key: value
+        for key, value in vars(args).items()
+        if isinstance(value, (int, float, str, bool, list))
     }
     result_payload = {
         "dataset": args.dataset,
         "fold": int(args.fold) if args.fold >= 0 else None,
         "selection_metric": args.selection_metric,
+        "backbone": args.resolved_backbone,
+        "hkt_paper_style": bool(getattr(args, "hkt_paper_style", False)),
+        "metric_definitions": {
+            "f1_hkt_paper": "sklearn f1 average=binary, same 0.5-threshold labels as HKT test README F-score",
+            "accuracy": "0.5 threshold on sigmoid logits",
+        },
         "elapsed_seconds": elapsed,
         "data": meta,
         "best": best_result,
