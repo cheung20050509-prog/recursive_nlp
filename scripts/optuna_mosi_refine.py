@@ -1,26 +1,28 @@
 #!/usr/bin/env python
-"""MOSI-only Optuna refine round with an extended categorical space.
+"""MOSI-only Optuna refine with an extended categorical space.
 
-This mirrors ``scripts/optuna_search.py`` but pins dataset=mosi, uses a new
-study (fresh sqlite under ``log/4080_restart/mosi_refine/``), and widens the
-search around the top trials observed in the first round:
+**Round 1 (historical):** new study under ``log/4080_restart/mosi_refine/``,
+widening the first broad search (``p_beta`` 24/32, ``p_gamma`` 8, etc.).
 
-- ``p_beta`` gains 24, 32 (first round's best was 8 with top-10 tied to 16).
-- ``p_gamma`` gains 8 (first round top-10 often landed at 16, the low bound).
-- ``halting_threshold`` gains 0.08, 0.1 (first round top-10 favoured 0.06).
-- ``dropout_prob`` gains 0.2 (first round top-10 favoured 0.3, the low bound).
-- ``syntax_temperature`` gains 0.25, 0.35 (first round top-10 favoured 0.5).
+**Round 2+ (default now):** best trial often **sat on bounds** of that space
+(``B0_dim`` min, ``B1_dim`` max, ``max_recursion_depth`` min, ``dropout_prob`` max,
+``syntax_temperature`` min). The ``SEARCH_SPACE`` below extends those edges:
 
-Optuna 4 rejects adding values to a CategoricalDistribution that was first
-seen with a different set, so we intentionally start a brand-new study and
-enqueue the top-K configs from the first round as seed trials so TPE has a
-warm start instead of cold-booting into the bigger space.
+- ``B0_dim``: add **32, 48** below 64.
+- ``B1_dim``: add **256** above 128.
+- ``max_recursion_depth``: add **2** below 3 (``train.py`` allows ``>=1``).
+- ``dropout_prob``: add **0.55, 0.6** above 0.5.
+- ``syntax_temperature``: add **0.15, 0.2** below 0.25.
 
-Typical launch (nohup-friendly):
+Optuna 4 cannot widen an existing study's categoricals: use a **new** output
+dir + study name (defaults: ``mosi_refine2``, ``ithp_mosi_mae_refine2``). Warm
+start imports history from the previous refine sqlite
+(``--seed_sqlite`` / ``--seed_study_name``).
 
-    nohup .../python -u scripts/optuna_mosi_refine.py \
-        --gpu 0 --random_trials 30 --tpe_trials 120 \
-        > log/4080_restart/mosi_refine/optuna_parent.log 2>&1 &
+Typical launch:
+
+    nohup .../python -u scripts/optuna_mosi_refine.py --gpu 0 \\
+        > log/4080_restart/mosi_refine2/optuna_parent.log 2>&1 &
 """
 
 import argparse
@@ -38,13 +40,17 @@ SEARCH_SPACE = {
     "learning_rate": [5e-6, 1e-5, 2e-5, 3e-5],
     "p_beta": [4, 8, 16, 24, 32],
     "p_gamma": [8, 16, 32, 64],
-    "B0_dim": [64, 128, 256],
-    "B1_dim": [32, 64, 128],
-    "max_recursion_depth": [3, 4, 5],
+    # Prior best often used B0=64 (old min) / B1=128 (old max) — explore below/above.
+    "B0_dim": [32, 48, 64, 128, 256],
+    "B1_dim": [32, 64, 128, 256],
+    # Best often used depth=3 (old min) — try shallower 2.
+    "max_recursion_depth": [2, 3, 4, 5],
     "halting_threshold": [0.02, 0.0285, 0.04, 0.06, 0.08, 0.1],
-    "dropout_prob": [0.2, 0.3, 0.5],
+    # Best often used dropout=0.5 (old max) — try slightly higher.
+    "dropout_prob": [0.2, 0.3, 0.5, 0.55, 0.6],
     "silver_span_loss_weight": [0.05, 0.1, 0.2],
-    "syntax_temperature": [0.25, 0.35, 0.5, 1.0, 2.0],
+    # Best often used syntax_temperature=0.25 (old min) — try lower.
+    "syntax_temperature": [0.15, 0.2, 0.25, 0.35, 0.5, 1.0, 2.0],
 }
 
 METRIC_DIRECTIONS = {
@@ -109,7 +115,12 @@ def parse_args():
     parser.add_argument("--tpe_trials", default=120, type=int)
     parser.add_argument("--n_epochs", default=20, type=int)
     parser.add_argument("--seed", default=128, type=int)
-    parser.add_argument("--output_dir", default="log/4080_restart/mosi_refine", type=str)
+    parser.add_argument(
+        "--output_dir",
+        default="log/4080_restart/mosi_refine2",
+        type=str,
+        help="New directory for this study (do not reuse an old sqlite with a smaller space).",
+    )
     parser.add_argument(
         "--primary_metric",
         default="mae",
@@ -121,19 +132,24 @@ def parse_args():
         choices=["valid_loss", "mae"],
     )
     parser.add_argument("--early_stopping_patience", default=0, type=int)
-    parser.add_argument("--study_name", default="ithp_mosi_mae_refine", type=str)
+    parser.add_argument(
+        "--study_name",
+        default="ithp_mosi_mae_refine2",
+        type=str,
+        help="Must be a new study name when SEARCH_SPACE changes.",
+    )
     parser.add_argument("--tpe_startup_trials", default=10, type=int)
     parser.add_argument(
         "--seed_sqlite",
-        default="log/4080_restart/mosi/optuna_study.sqlite3",
+        default="log/4080_restart/mosi_refine/optuna_study.sqlite3",
         type=str,
-        help="Prior Optuna sqlite whose completed trials are imported as frozen history so TPE warms up with their density.",
+        help="Prior completed refine study to import as frozen history (default: round-1 refine).",
     )
     parser.add_argument(
         "--seed_study_name",
-        default="ithp_mosi_mae",
+        default="ithp_mosi_mae_refine",
         type=str,
-        help="Study name inside --seed_sqlite to pull warm-start history from.",
+        help="Study name inside --seed_sqlite (default: ithp_mosi_mae_refine).",
     )
     parser.add_argument(
         "--import_mode",
