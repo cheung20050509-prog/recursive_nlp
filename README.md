@@ -1,12 +1,12 @@
-# Recursive-ITHP
+# RITHM
 
-**Recursive Information Theoretical Halting Process (Recursive-ITHP)** extends the ITHP multimodal fusion idea with a **learned halting** mechanism: the model may stop early when the latent state is sufficient, or recurse deeper when integrating audio / video under Information Bottleneck-style objectives.
+**RITHM** (**R**ecursive **I**nformation-**T**heoretic **H**alting **M**odel) is our implementation of **recursive multimodal fusion with learned halting**: the model may stop early when the latent state is sufficient, or recurse deeper when integrating audio / video under Information Bottleneck–style objectives. It builds on the ITHP line of work (see also *Recursive Information Theoretical Halting Process* in the paper draft).
 
-Upstream ITHP reference: [joshuaxiao98/ITHP](https://github.com/joshuaxiao98/ITHP). This fork adds regression and classification paths, **CH-SIMS v2**, and **Optuna** tooling.
+Upstream ITHP reference: [joshuaxiao98/ITHP](https://github.com/joshuaxiao98/ITHP). This repository adds regression and classification paths, **CH-SIMS v2**, and **Optuna** tooling around **RITHM**.
 
 ## What is in this repository
 
-- **CMU-MOSI / CMU-MOSEI**: recursive sentiment training (`train.py`), silver-span syntax losses where applicable, KuDA-style test metrics.
+- **CMU-MOSI / CMU-MOSEI**: **RITHM** sentiment training (`train.py`), silver-span syntax losses where applicable, KuDA-style test metrics.
 - **CH-SIMS v2 (`simsv2`)**: MMSA-style pickled features, `bert-base-chinese` (or local weights via `--model`), normalization helpers in `simsv2_data.py`, metrics in `simsv2_metrics.py`.
 - **MUStARD / UR-FUNNY**: HKT-paper-style binary classification (`train_hkt_binary.py`) and Optuna driver `scripts/optuna_hkt_search.py` (ALBERT / pickle splits).
 - **Hyperparameter search**: two-phase Random + TPE Optuna studies (`scripts/optuna_search.py` for `mosi` / `mosei` / `simsv2`; SQLite storage, resumable).
@@ -29,7 +29,7 @@ pip install -r requirements.txt
 ### Train (examples)
 
 ```bash
-# CMU sentiment (BERT-base English features + recursive ITHP)
+# CMU sentiment (BERT-base English features + RITHM)
 python train.py --dataset mosi
 python train.py --dataset mosei
 
@@ -70,7 +70,7 @@ bash scripts/download_bert_chinese.sh   # optional local weights
 
 ## Results (indicative)
 
-Numbers depend on split, seed, and Optuna budget. Recent Optuna-best **test** checkpoints are roughly:
+Numbers depend on split, seed, and Optuna budget. Recent **RITHM** Optuna-best **test** checkpoints are roughly:
 
 | Dataset | Notes |
 |--------|--------|
@@ -87,7 +87,7 @@ Treat `baseline_table.tex` as the single source for the exact figures you cite i
 |------|------|
 | `train.py` | Main MOSI/MOSEI/SIMSv2 trainer |
 | `train_hkt_binary.py` | MUStARD / UR-FUNNY binary trainer |
-| `Recursive_ITHP.py`, `ITHP.py` | Model cores |
+| `Recursive_ITHP.py`, `ITHP.py` | **RITHM** model cores (legacy filenames; class names still use ITHP) |
 | `simsv2_data.py`, `simsv2_metrics.py` | SIMSv2 IO / metrics |
 | `global_configs.py` | Shared knobs |
 | `scripts/optuna_search.py` | Optuna for mosi / mosei / simsv2 |
