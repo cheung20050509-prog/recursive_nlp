@@ -5,5 +5,13 @@ datasets/*.pkl
 datasets/hkt/
 log/
 runs/
+pretrained/
 
 *.log
+# LaTeX build artifacts
+recursive_ITHP_manuscript/*.aux
+recursive_ITHP_manuscript/*.bbl
+recursive_ITHP_manuscript/*.blg
+recursive_ITHP_manuscript/*.out
+recursive_ITHP_manuscript/*.pdf
+334_Learning_by_Comparing_Boos.pdf

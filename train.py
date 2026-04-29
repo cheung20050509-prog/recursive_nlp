@@ -2,6 +2,8 @@ import argparse
 import os
 import random
 import pickle
+from pathlib import Path
+
 import numpy as np
 import copy
 
@@ -20,11 +22,12 @@ from transformers import get_linear_schedule_with_warmup
 from deberta_ITHP import ITHP_DeBertaForSequenceClassification
 import global_configs
 from global_configs import DEVICE
+from simsv2_metrics import compute_sims_regression_metrics
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=str, default="/root/autodl-tmp/recursive_language/deberta-v3-base", )
 parser.add_argument("--dataset", type=str,
-                    choices=["mosi", "mosei"], default="mosi")
+                    choices=["mosi", "mosei", "simsv2"], default="mosi")
 parser.add_argument("--max_seq_length", type=int, default=50)
 parser.add_argument("--train_batch_size", type=int, default=8)
 parser.add_argument("--dev_batch_size", type=int, default=128)
@@ -65,6 +68,15 @@ if args.early_stopping_patience < 0:
     raise ValueError('early_stopping_patience must be non-negative')
 
 global_configs.MAX_RECURSION_DEPTH = args.max_recursion_depth
+
+_DEBERTA_DEFAULT = "/root/autodl-tmp/recursive_language/deberta-v3-base"
+if args.dataset == "simsv2":
+    # CH-SIMSv2: regression in [-1, 1]; MOSI-style Acc7 auxiliary does not apply.
+    args.acc7_loss_weight = 0.0
+    _repo = Path(__file__).resolve().parent
+    _local_zh = _repo / "pretrained" / "bert-base-chinese"
+    if args.model == _DEBERTA_DEFAULT or "deberta" in os.path.basename(os.path.normpath(args.model)).lower():
+        args.model = str(_local_zh) if _local_zh.is_dir() else "google-bert/bert-base-chinese"
 
 global_configs.set_dataset_config(args.dataset)
 ACOUSTIC_DIM, VISUAL_DIM, TEXT_DIM = (global_configs.ACOUSTIC_DIM, global_configs.VISUAL_DIM,
@@ -400,6 +412,10 @@ def prepare_deberta_input(tokens, visual, acoustic, tokenizer):
 
 
 def get_tokenizer(model):
+    if args.dataset == "simsv2":
+        from transformers import BertTokenizer
+
+        return BertTokenizer.from_pretrained(model)
     return DebertaV2Tokenizer.from_pretrained(model)
 
 
@@ -426,6 +442,22 @@ def get_appropriate_dataset(data, silver_records=None):
 def set_up_data_loader():
     with open(f"datasets/{args.dataset}.pkl", "rb") as handle:
         data = pickle.load(handle)
+
+    if args.dataset == "simsv2":
+        from simsv2_data import normalize_simsv2_pickled_data
+
+        data = normalize_simsv2_pickled_data(data)
+        print("SIMSV2: normalized pickle to ITHP list format (train/dev/test)")
+
+    if args.dataset == "simsv2":
+        (words0, vis0, ac0), _, _ = data["train"][0]
+        global_configs.apply_simsv2_runtime_dims(int(ac0.shape[-1]), int(vis0.shape[-1]))
+        global ACOUSTIC_DIM, VISUAL_DIM
+        ACOUSTIC_DIM = global_configs.ACOUSTIC_DIM
+        VISUAL_DIM = global_configs.VISUAL_DIM
+        print(
+            f"SIMSV2: runtime modal dims acoustic={ACOUSTIC_DIM} visual={VISUAL_DIM} (from first train sample)"
+        )
 
     silver_span_cache = load_silver_span_cache()
 
@@ -496,9 +528,22 @@ def set_random_seed(seed: int):
 
 
 def prep_for_training(num_train_optimization_steps: int):
-    model = ITHP_DeBertaForSequenceClassification.from_pretrained(
-        args.model, multimodal_config=args, num_labels=1,
-    )
+    if args.dataset == "simsv2":
+        from transformers import BertConfig
+        from bert_chinese_ITHP import ITHP_BertForSequenceClassification
+
+        config = BertConfig.from_pretrained(args.model)
+        config.num_labels = 1
+        model = ITHP_BertForSequenceClassification.from_pretrained(
+            args.model,
+            config=config,
+            multimodal_config=args,
+            ignore_mismatched_sizes=True,
+        )
+    else:
+        model = ITHP_DeBertaForSequenceClassification.from_pretrained(
+            args.model, multimodal_config=args, num_labels=1,
+        )
 
     model.to(DEVICE)
 
@@ -554,14 +599,22 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
             syntax_span_masks=syntax_span_masks,
         )
         regression_loss = regression_loss_fct(logits.view(-1), label_ids.view(-1))
-        acc7_targets = build_acc7_targets(label_ids.view(-1))
-        acc7_loss = acc7_loss_fct(acc7_logits.view(-1, 7), acc7_targets)
-        loss = (
-            regression_loss
-            + args.acc7_loss_weight * acc7_loss
-            + args.silver_span_loss_weight * syntax_loss
-            + 2 / (args.p_beta + args.p_gamma) * IB_loss
-        )
+        if args.acc7_loss_weight > 0:
+            acc7_targets = build_acc7_targets(label_ids.view(-1))
+            acc7_loss = acc7_loss_fct(acc7_logits.view(-1, 7), acc7_targets)
+            loss = (
+                regression_loss
+                + args.acc7_loss_weight * acc7_loss
+                + args.silver_span_loss_weight * syntax_loss
+                + 2 / (args.p_beta + args.p_gamma) * IB_loss
+            )
+        else:
+            acc7_loss = regression_loss.new_zeros(())
+            loss = (
+                regression_loss
+                + args.silver_span_loss_weight * syntax_loss
+                + 2 / (args.p_beta + args.p_gamma) * IB_loss
+            )
 
         if not torch.isfinite(loss):
             print(
@@ -635,9 +688,13 @@ def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
                 syntax_span_masks=syntax_span_masks,
             )
             regression_loss = regression_loss_fct(logits.view(-1), label_ids.view(-1))
-            acc7_targets = build_acc7_targets(label_ids.view(-1))
-            acc7_loss = acc7_loss_fct(acc7_logits.view(-1, 7), acc7_targets)
-            loss = regression_loss + args.acc7_loss_weight * acc7_loss
+            if args.acc7_loss_weight > 0:
+                acc7_targets = build_acc7_targets(label_ids.view(-1))
+                acc7_loss = acc7_loss_fct(acc7_logits.view(-1, 7), acc7_targets)
+                loss = regression_loss + args.acc7_loss_weight * acc7_loss
+            else:
+                acc7_loss = regression_loss.new_zeros(())
+                loss = regression_loss
 
             if not torch.isfinite(loss) or not torch.isfinite(syntax_loss):
                 print(
@@ -673,7 +730,10 @@ def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
     if nb_dev_steps == 0 or nb_dev_examples == 0:
         return float("nan"), 0.0, 0.0, 0.0, encountered_nonfinite, None
 
-    valid_metrics = compute_sentiment_metrics(np.array(preds), np.array(labels))
+    if args.dataset == "simsv2":
+        valid_metrics = compute_sims_regression_metrics(np.array(preds), np.array(labels))
+    else:
+        valid_metrics = compute_sentiment_metrics(np.array(preds), np.array(labels))
 
     return (
         dev_loss / nb_dev_steps,
@@ -862,7 +922,10 @@ def print_merge_trace_samples(syntax_samples):
 
 def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero=False, return_acc7=False):
     preds, y_test, avg_recursion_steps, max_depth_hit_rate, syntax_samples, avg_syntax_loss = test_epoch(model, test_dataloader)
-    metrics = compute_sentiment_metrics(preds, y_test, use_zero=use_zero)
+    if args.dataset == "simsv2":
+        metrics = compute_sims_regression_metrics(preds, y_test)
+    else:
+        metrics = compute_sentiment_metrics(preds, y_test, use_zero=use_zero)
 
     if return_acc7:
         return metrics, avg_recursion_steps, max_depth_hit_rate, syntax_samples, avg_syntax_loss
@@ -964,36 +1027,73 @@ def train(
     test_metrics, test_avg_steps, test_hit_rate, syntax_samples, test_syntax_loss = test_score_model(
         model, test_data_loader, return_acc7=True
     )
-    print(
-        "TEST: best_epoch:{}, selection_metric:{}, selection_score:{}, train_loss:{}, valid_loss:{}, valid_mae:{}, valid_corr:{}, train_syntax_loss:{}, valid_syntax_loss:{}, train_avg_steps:{}, valid_avg_steps:{}, train_hit_max_depth_rate:{}, valid_hit_max_depth_rate:{}, test_acc:{}, acc7:{}, acc2_zero:{}, f1_score_zero:{}, acc2_no_zero:{}, f1_score_no_zero:{}, mae:{}, corr:{}, f1_score:{}, test_avg_steps:{}, test_hit_max_depth_rate:{}, test_syntax_loss:{}".format(
-            best_epoch,
-            args.selection_metric,
-            best_selection_score,
+    if args.dataset == "simsv2":
+        print(
+            "TEST: best_epoch:{}, selection_metric:{}, selection_score:{}, train_loss:{}, valid_loss:{}, valid_mae:{}, valid_corr:{}, train_syntax_loss:{}, valid_syntax_loss:{}, train_avg_steps:{}, valid_avg_steps:{}, train_hit_max_depth_rate:{}, valid_hit_max_depth_rate:{}, Mult_acc_2:{}, Mult_acc_3:{}, Mult_acc_5:{}, F1_score:{}, mae:{}, corr:{}, test_avg_steps:{}, test_hit_max_depth_rate:{}, test_syntax_loss:{}".format(
+                best_epoch,
+                args.selection_metric,
+                best_selection_score,
+                best_train_loss,
+                best_valid_loss,
+                best_valid_metrics["mae"] if best_valid_metrics is not None else float("nan"),
+                best_valid_metrics["corr"] if best_valid_metrics is not None else float("nan"),
+                best_train_syntax_loss,
+                best_valid_syntax_loss,
+                best_train_avg_steps,
+                best_valid_avg_steps,
+                best_train_hit_rate,
+                best_valid_hit_rate,
+                test_metrics["Mult_acc_2"],
+                test_metrics["Mult_acc_3"],
+                test_metrics["Mult_acc_5"],
+                test_metrics["F1_score"],
+                test_metrics["mae"],
+                test_metrics["corr"],
+                test_avg_steps,
+                test_hit_rate,
+                test_syntax_loss,
+            )
+        )
+    else:
+        print(
+            "TEST: best_epoch:{}, selection_metric:{}, selection_score:{}, train_loss:{}, valid_loss:{}, valid_mae:{}, valid_corr:{}, train_syntax_loss:{}, valid_syntax_loss:{}, train_avg_steps:{}, valid_avg_steps:{}, train_hit_max_depth_rate:{}, valid_hit_max_depth_rate:{}, test_acc:{}, acc7:{}, acc2_zero:{}, f1_score_zero:{}, acc2_no_zero:{}, f1_score_no_zero:{}, mae:{}, corr:{}, f1_score:{}, test_avg_steps:{}, test_hit_max_depth_rate:{}, test_syntax_loss:{}".format(
+                best_epoch,
+                args.selection_metric,
+                best_selection_score,
+                best_train_loss,
+                best_valid_loss,
+                best_valid_metrics["mae"] if best_valid_metrics is not None else float("nan"),
+                best_valid_metrics["corr"] if best_valid_metrics is not None else float("nan"),
+                best_train_syntax_loss,
+                best_valid_syntax_loss,
+                best_train_avg_steps,
+                best_valid_avg_steps,
+                best_train_hit_rate,
+                best_valid_hit_rate,
+                test_metrics["acc2_no_zero"],
+                test_metrics["acc7"],
+                test_metrics["acc2_zero"],
+                test_metrics["f1_score_zero"],
+                test_metrics["acc2_no_zero"],
+                test_metrics["f1_score_no_zero"],
+                test_metrics["mae"],
+                test_metrics["corr"],
+                test_metrics["f1_score_no_zero"],
+                test_avg_steps,
+                test_hit_rate,
+                test_syntax_loss,
+            )
+        )
+    print_merge_trace_samples(syntax_samples)
+    if args.dataset == "simsv2":
+        return (
             best_train_loss,
             best_valid_loss,
-            best_valid_metrics["mae"] if best_valid_metrics is not None else float("nan"),
-            best_valid_metrics["corr"] if best_valid_metrics is not None else float("nan"),
-            best_train_syntax_loss,
-            best_valid_syntax_loss,
-            best_train_avg_steps,
-            best_valid_avg_steps,
-            best_train_hit_rate,
-            best_valid_hit_rate,
-            test_metrics["acc2_no_zero"],
-            test_metrics["acc7"],
-            test_metrics["acc2_zero"],
-            test_metrics["f1_score_zero"],
-            test_metrics["acc2_no_zero"],
-            test_metrics["f1_score_no_zero"],
+            test_metrics["Mult_acc_2"],
             test_metrics["mae"],
             test_metrics["corr"],
-            test_metrics["f1_score_no_zero"],
-            test_avg_steps,
-            test_hit_rate,
-            test_syntax_loss,
+            test_metrics["F1_score"],
         )
-    )
-    print_merge_trace_samples(syntax_samples)
     return (
         best_train_loss,
         best_valid_loss,

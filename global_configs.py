@@ -29,6 +29,9 @@ def set_dataset_config(dataset_name):
         "sarcasm_full": {"ACOUSTIC_DIM": 81, "VISUAL_DIM": 91, "TEXT_DIM": 768},
         "urfunny_full": {"ACOUSTIC_DIM": 81, "VISUAL_DIM": 91, "TEXT_DIM": 768},
         "humor_full": {"ACOUSTIC_DIM": 81, "VISUAL_DIM": 91, "TEXT_DIM": 768},
+        # CH-SIMSv2 (MMSA processed): placeholder dims; always overridden at load from the
+        # first training example (see ``apply_simsv2_runtime_dims``), e.g. 25 x 177.
+        "simsv2": {"ACOUSTIC_DIM": 33, "VISUAL_DIM": 709, "TEXT_DIM": 768},
     }
 
     config = dataset_configs.get(dataset_name)
@@ -38,4 +41,11 @@ def set_dataset_config(dataset_name):
         TEXT_DIM = config["TEXT_DIM"]
     else:
         raise ValueError(f"Invalid dataset name: {dataset_name}")
+
+
+def apply_simsv2_runtime_dims(acoustic_dim: int, visual_dim: int):
+    """Override ``ACOUSTIC_DIM`` / ``VISUAL_DIM`` after inspecting ``datasets/simsv2.pkl``."""
+    global ACOUSTIC_DIM, VISUAL_DIM
+    ACOUSTIC_DIM = int(acoustic_dim)
+    VISUAL_DIM = int(visual_dim)
 

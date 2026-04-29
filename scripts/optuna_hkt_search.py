@@ -10,15 +10,21 @@ trainer uses by default). For MUStARD the search runs on the HKT single-fold
 pickle (539/68/68); set ``--fold k`` to pin to a specific speaker-independent
 fold instead. UR-FUNNY always uses its official fold.
 
-Typical launch:
+Typical launch (total budget ~80 trials: random exploration + TPE):
 
     python scripts/optuna_hkt_search.py --dataset mustard --gpu 0 \
-        --random_trials 30 --tpe_trials 80 \
+        --random_trials 20 --tpe_trials 60 \
         --output_dir log/4080_restart_hkt
 
     python scripts/optuna_hkt_search.py --dataset urfunny --gpu 0 \
-        --random_trials 20 --tpe_trials 50 \
+        --random_trials 15 --tpe_trials 45 \
         --output_dir log/4080_restart_hkt
+
+Reusing or restarting studies: the same ``--output_dir``, ``--study_prefix``,
+and ``--primary_metric`` load ``optuna_study.sqlite3`` with
+``load_if_exists=True``. To append trials, pass ``--random_trials`` /
+``--tpe_trials`` as the *remaining* counts for each phase. For a clean sweep,
+use a new ``--output_dir`` or ``--study_prefix``.
 """
 
 from __future__ import annotations
@@ -39,20 +45,25 @@ GRACEFUL_STOP_REQUESTED = False
 GRACEFUL_STOP_SIGNAL = None
 
 
-# Kept intentionally narrower than the MOSI/MOSEI search: drops
-# ``silver_span_loss_weight`` and ``syntax_temperature`` (HKT binary path does
-# not use silver spans), and adds ``train_batch_size`` since HKT is very
-# sensitive to batch size.
+# Narrower than MOSI/MOSEI (no silver spans). Includes ``train_batch_size`` and
+# extra ITHP knobs exposed by ``train_hkt_binary.py`` (IB path, fusion, schedule).
 SEARCH_SPACE = {
     "learning_rate": [5e-6, 1e-5, 2e-5, 3e-5],
     "p_beta": [4, 8, 16],
     "p_gamma": [16, 32, 64],
+    "p_lambda": [0.2, 0.3, 0.5],
+    "beta_shift": [0.8, 1.0, 1.2],
     "B0_dim": [64, 128, 256],
     "B1_dim": [32, 64, 128],
+    "inter_dim": [128, 256, 384],
     "max_recursion_depth": [3, 4, 5],
     "halting_threshold": [0.02, 0.0285, 0.04, 0.06],
     "dropout_prob": [0.3, 0.5],
+    "drop_prob": [0.2, 0.3, 0.4],
+    "warmup_proportion": [0.05, 0.1, 0.15],
     "train_batch_size": [8, 16, 32],
+    "gradient_accumulation_step": [1, 2],
+    "max_grad_norm": [0.5, 1.0],
 }
 
 METRIC_DIRECTIONS = {
@@ -111,8 +122,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True, choices=["mustard", "urfunny", "sarcasm", "humor"])
     parser.add_argument("--gpu", required=True, type=int)
-    parser.add_argument("--random_trials", default=30, type=int)
-    parser.add_argument("--tpe_trials", default=80, type=int)
+    parser.add_argument("--random_trials", default=20, type=int)
+    parser.add_argument("--tpe_trials", default=60, type=int)
     parser.add_argument("--n_epochs", default=None, type=int)
     parser.add_argument("--seed", default=5149, type=int)
     parser.add_argument("--early_stopping_patience", default=None, type=int)

@@ -1,0 +1,129 @@
+% Requires in preamble: \usepackage{booktabs,multirow}
+%
+% ----- Which three datasets to report in the main paper? -----
+% Recommended set (sentiment + English/Chinese coverage, strongest empirical story):
+%   (1) CMU-MOSI + CMU-MOSEI  -> Table~\ref{tab:baseline_mosi_mosei}
+%   (2) CH-SIMS v2            -> Table~\ref{tab:baseline_simsv2}
+% Keep Table~\ref{tab:baseline_mustard_cls} (UR-FUNNY / MUStARD) in appendix or
+% supplement unless you strengthen humor runs; do not headline weak test-acc rows.
+%
+% Row label for our method (was ``PRISM (InfoGate fusion)'' in drafts):
+\providecommand{\OursRow}{\textbf{Recursive-ITHP (Ours)}}
+%
+% Numbers below: test-set metrics at the checkpoint selected on validation
+% (Optuna best trial; MOSI from extended refine study).
+
+\begin{table*}[t]
+    \centering
+    \caption{Comparison with published models on CMU-MOSI and CMU-MOSEI. $^\dagger$: reproduced or alternate splits as in prior work. Best per column in \textbf{bold}, second-best \underline{underlined}.}
+    \label{tab:baseline_mosi_mosei}
+    \resizebox{\linewidth}{!}{%
+    \begin{tabular}{l|ccccc|ccccc}
+    \toprule
+    \multirow{2}{*}{Model} & \multicolumn{5}{c|}{CMU-MOSI} & \multicolumn{5}{c}{CMU-MOSEI} \\
+     & Acc7$\uparrow$ & Acc2$\uparrow$ & F1$\uparrow$ & MAE$\downarrow$ & Corr$\uparrow$
+     & Acc7$\uparrow$ & Acc2$\uparrow$ & F1$\uparrow$ & MAE$\downarrow$ & Corr$\uparrow$ \\
+    \midrule
+    MFM          & 33.3 & 80.0 & 80.1 & 0.948 & 0.664 & 50.8 & 83.4 & 83.4 & 0.580 & 0.722 \\
+    Self-MM      & 45.8 & 84.9 & 84.8 & 0.731 & 0.785 & 53.0 & 85.2 & 85.2 & 0.540 & 0.763 \\
+    AtCAF$^\dagger$  & 46.5 & 88.6 & 88.5 & 0.650 & 0.831 & \underline{55.9} & 87.0 & 86.8 & 0.508 & 0.785 \\
+    DLF$^\dagger$    & 47.1 & 85.1 & 85.0 & 0.731 & 0.781 & 53.9 & 85.4 & 85.3 & 0.536 & 0.764 \\
+    KuDA$^\dagger$   & 47.1 & 86.4 & 86.5 & 0.705 & 0.795 & 52.9 & 86.5 & 86.6 & 0.529 & 0.776 \\
+    DEVA$^\dagger$   & 46.3 & 86.3 & 86.3 & 0.730 & 0.787 & 52.3 & 86.1 & 86.2 & 0.541 & 0.769 \\
+    C-MIB        & 47.7 & 87.8 & 87.8 & 0.662 & 0.835 & 52.7 & 86.9 & 86.8 & 0.542 & 0.784 \\
+    ITHP         & 47.7 & 88.5 & 88.5 & 0.663 & 0.856 & 52.2 & 87.1 & 87.1 & 0.550 & 0.792 \\
+    Multimodal Boosting & \underline{49.1} & 88.5 & 88.4 & 0.634 & 0.855 & 54.0 & 86.5 & 86.5 & 0.523 & 0.779 \\
+    CaMIB$^\dagger$  & 48.0 & \underline{89.8} & \textbf{89.8} & 0.616 & 0.857 & 53.5 & 87.3 & 87.2 & 0.517 & 0.788 \\
+    DMD          & 44.9 & 84.3 & 84.3 & 0.726 & 0.788 & 52.8 & 84.6 & 84.6 & 0.538 & 0.768 \\
+    EMOE         & 45.2 & 84.8 & 84.8 & 0.723 & 0.790 & 52.5 & 85.0 & 85.0 & 0.542 & 0.760 \\
+    TMSON$^\dagger$  & 47.4 & 87.2 & 87.2 & 0.687 & 0.809 & 55.6 & 86.4 & 86.2 & 0.526 & 0.766 \\
+    MOAC$^\dagger$   & 48.6 & 89.0 & \underline{89.0} & \underline{0.605} & \underline{0.857} & 54.3 & \underline{87.6} & \underline{87.6} & 0.512 & \underline{0.793} \\
+    \midrule
+    \OursRow & \textbf{52.0} & 89.5 & 89.5 & \textbf{0.580} & \textbf{0.864} & 54.7 & 87.1 & 87.1 & \textbf{0.501} & \textbf{0.798} \\
+    \bottomrule
+    \end{tabular}%
+    }
+\end{table*}
+
+\begin{table}[t]
+    \centering
+    \caption{Comparison on CH-SIMS v2 (multimodal sentiment). Baselines from MMSA / KuDA reporting.}
+    \label{tab:baseline_simsv2}
+    \resizebox{\columnwidth}{!}{%
+    \begin{tabular}{l|cccccc}
+    \toprule
+    Model & Acc5$\uparrow$ & Acc3$\uparrow$ & Acc2$\uparrow$ & F1$\uparrow$ & MAE$\downarrow$ & Corr$\uparrow$ \\
+    \midrule
+    EF-LSTM      & 53.7 & \underline{73.5} & 80.1 & 80.0 & 0.309 & 0.700 \\
+    LF-DNN       & 51.8 & 71.2 & 77.8 & 77.9 & 0.322 & 0.668 \\
+    TFN          & 53.3 & 70.9 & 78.1 & 78.1 & 0.322 & 0.662 \\
+    LMF          & 51.6 & 70.0 & 77.8 & 77.8 & 0.327 & 0.651 \\
+    MFN          & \textbf{55.4} & 72.7 & 79.4 & 79.4 & \underline{0.301} & 0.712 \\
+    Graph-MFN    & 48.9 & 68.6 & 76.6 & 76.6 & 0.334 & 0.644 \\
+    MISA         & 47.5 & 68.9 & 78.2 & 78.3 & 0.342 & 0.671 \\
+    MAG-BERT     & 49.2 & 70.6 & 77.1 & 77.1 & 0.346 & 0.641 \\
+    Self-MM      & 53.5 & 72.7 & 78.7 & 78.6 & 0.315 & 0.691 \\
+    MMIM         & 50.5 & 70.4 & 77.8 & 77.8 & 0.339 & 0.641 \\
+    AV-MC        & 52.1 & 73.2 & 80.6 & 80.7 & 0.301 & 0.721 \\
+    KuDA$^\dagger$ & 53.1 & \textbf{74.3} & \textbf{80.2} & \textbf{80.1} & \textbf{0.289} & \textbf{0.741} \\
+    \midrule
+    \OursRow & 51.2 & 71.0 & 76.8 & 76.9 & 0.336 & 0.641 \\
+    \bottomrule
+    \end{tabular}%
+    }
+\end{table}
+
+\begin{table*}[t]
+    \centering
+    \caption{Binary humor / sarcasm classification (accuracy, \%). \textit{(a)}~UR-FUNNY; \textit{(b)}~MUStARD. HKT-style 0.5-threshold accuracy; parameter counts where reported. $^\dagger$: literature values without matched parameter counts ($-$). Recursive-ITHP uses ALBERT-base-v2 and the same pickle splits as HKT/MOAC references.}
+    \label{tab:baseline_mustard_cls}
+    \noindent\textit{(a) UR-FUNNY}\\[0.35ex]
+    \resizebox{\linewidth}{!}{%
+    \begin{tabular}{lccc}
+    \toprule
+    Model & Acc (\%) & F1$_{\mathrm{bin}}$ (\%) & \#Parameters \\
+    \midrule
+    MISA-ALBERT$^\dagger$ & 69.82 & $-$ & $-$ \\
+    MAG-ALBERT$^\dagger$ & 72.43 & $-$ & $-$ \\
+    HKT$^\dagger$ & 77.36 & $-$ & $-$ \\
+    \midrule
+    HKT & 76.46 & $-$ & 17{,}066{,}564 \\
+    MCL & 77.67 & $-$ & 13{,}762{,}973 \\
+    MGCL & \underline{78.06} & $-$ & 14{,}062{,}342 \\
+    \midrule
+    \textbf{MOAC} & \textbf{78.57} & $-$ & \textbf{13{,}272{,}272} \\
+    \midrule
+    \OursRow & 74.65 & 74.90 & $-$ \\
+    \bottomrule
+    \end{tabular}%
+    }
+
+    \vspace{1.25ex}
+
+    \noindent\textit{(b) MUStARD}\\[0.35ex]
+    \resizebox{\linewidth}{!}{%
+    \begin{tabular}{lccc}
+    \toprule
+    Model & Acc (\%) & F1$_{\mathrm{bin}}$ (\%) & \#Parameters \\
+    \midrule
+    MISA-ALBERT$^\dagger$ & 66.18 & $-$ & $-$ \\
+    MAG-ALBERT$^\dagger$ & 69.12 & $-$ & $-$ \\
+    HKT$^\dagger$ & 79.41 & $-$ & $-$ \\
+    \midrule
+    HKT & 76.47 & $-$ & 17{,}101{,}372 \\
+    MCL & 77.94 & $-$ & 13{,}828{,}449 \\
+    MGCL & 77.94 & $-$ & 14{,}282{,}000 \\
+    \midrule
+    \textbf{MOAC} & \textbf{80.88} & $-$ & \textbf{13{,}454{,}832} \\
+    \midrule
+    \OursRow & 66.18 & 70.89 & $-$ \\
+    \bottomrule
+    \end{tabular}%
+    }
+\end{table*}
+
+% --- Author note (venue positioning) ---
+% Main-text trio (MOSI, MOSEI, SIMSv2): lead with MAE/Corr (+ MOSI Acc7) where we
+% lead the table; Acc2/F1 vs CaMIB/MOAC need careful wording.
+% SIMSv2: still below KuDA on this grid---report as additional Chinese benchmark, not
+% as beating KuDA. Humor table: below MOAC; prefer appendix unless numbers improve.

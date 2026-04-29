@@ -3,6 +3,14 @@
 
 Phase 1 uses RandomSampler for broad exploration.
 Phase 2 reuses the same Optuna study with TPESampler for stronger search.
+
+CH-SIMSv2 (``--dataset simsv2``): defaults tuned for BERT-Chinese regression —
+``n_epochs=25``, ``early_stopping_patience=4``, ``random_trials=20``,
+``tpe_trials=60`` (80 trials total), ``SEARCH_SPACE_SIMSV2`` (no silver spans;
+``silver_span_loss_weight`` fixed to 0; extra ``train.py`` knobs). Use
+``--base_model /path/to/bert-base-chinese`` to pin weights. MOSI/MOSEI keep the
+original grid and 50+100 trials unless overridden. Default ``--output_dir`` for
+``simsv2`` is ``log/4080_restart`` (study lives under ``.../log/4080_restart/simsv2/``).
 """
 
 import argparse
@@ -20,7 +28,8 @@ GRACEFUL_STOP_REQUESTED = False
 GRACEFUL_STOP_SIGNAL = None
 
 
-SEARCH_SPACE = {
+# MOSI / MOSEI (silver span cache + regression / acc7 auxiliary).
+SEARCH_SPACE_DEFAULT = {
     "learning_rate": [5e-6, 1e-5, 2e-5, 3e-5],
     "p_beta": [4, 8, 16],
     "p_gamma": [16, 32, 64],
@@ -31,6 +40,29 @@ SEARCH_SPACE = {
     "dropout_prob": [0.3, 0.5],
     "silver_span_loss_weight": [0.05, 0.1, 0.2],
     "syntax_temperature": [0.5, 1.0, 2.0],
+}
+
+# CH-SIMSv2: no silver cache; keep syntax_temperature; fix silver span loss to 0;
+# add schedule / IB-adjacent knobs aligned with ``train.py`` CLI.
+SEARCH_SPACE_SIMSV2 = {
+    "learning_rate": [5e-6, 1e-5, 2e-5, 3e-5],
+    "p_beta": [4, 8, 16],
+    "p_gamma": [16, 32, 64],
+    "p_lambda": [0.2, 0.3, 0.5],
+    "beta_shift": [0.8, 1.0, 1.2],
+    "B0_dim": [64, 128, 256],
+    "B1_dim": [32, 64, 128],
+    "inter_dim": [128, 256],
+    "max_recursion_depth": [3, 4, 5],
+    "halting_threshold": [0.02, 0.0285, 0.04, 0.06],
+    "dropout_prob": [0.3, 0.5],
+    "drop_prob": [0.2, 0.3],
+    "warmup_proportion": [0.05, 0.1],
+    "syntax_temperature": [0.5, 1.0, 2.0],
+    "silver_span_loss_weight": [0.0],
+    "train_batch_size": [4, 8, 16],
+    "gradient_accumulation_step": [1, 2],
+    "max_grad_norm": [0.5, 1.0],
 }
 
 METRIC_DIRECTIONS = {
@@ -45,8 +77,8 @@ METRIC_DIRECTIONS = {
 }
 
 METRIC_ALIASES = {
-    "acc2_no_zero": ["acc2_no_zero", "test_acc"],
-    "f1_score_no_zero": ["f1_score_no_zero", "f1_score"],
+    "acc2_no_zero": ["acc2_no_zero", "test_acc", "Mult_acc_2"],
+    "f1_score_no_zero": ["f1_score_no_zero", "f1_score", "F1_score"],
 }
 
 PYTHON = "/root/autodl-tmp/anaconda3/envs/ITHP5090/bin/python"
@@ -87,22 +119,45 @@ def maybe_stop_study_after_trial(study, trial):
 
 
 def default_n_epochs(dataset):
-    return 10 if dataset == "mosei" else 20
+    if dataset == "mosei":
+        return 10
+    if dataset == "simsv2":
+        return 25
+    return 20
 
 
 def default_early_stopping_patience(dataset):
-    return 3 if dataset == "mosei" else 0
+    if dataset == "mosei":
+        return 3
+    if dataset == "simsv2":
+        return 4
+    return 0
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", required=True, choices=["mosi", "mosei"])
+    parser.add_argument("--dataset", required=True, choices=["mosi", "mosei", "simsv2"])
     parser.add_argument("--gpu", required=True, type=int)
-    parser.add_argument("--random_trials", default=50, type=int)
-    parser.add_argument("--tpe_trials", default=100, type=int)
+    parser.add_argument(
+        "--random_trials",
+        default=None,
+        type=int,
+        help="Random phase trials (default: 50 mosi/mosei, 20 simsv2).",
+    )
+    parser.add_argument(
+        "--tpe_trials",
+        default=None,
+        type=int,
+        help="TPE phase trials (default: 100 mosi/mosei, 60 simsv2).",
+    )
     parser.add_argument("--n_epochs", default=None, type=int)
     parser.add_argument("--seed", default=128, type=int)
-    parser.add_argument("--output_dir", default="optuna_results", type=str)
+    parser.add_argument(
+        "--output_dir",
+        default=None,
+        type=str,
+        help="Trial logs + sqlite root. Default: log/4080_restart for simsv2, optuna_results otherwise.",
+    )
     parser.add_argument(
         "--primary_metric",
         default="mae",
@@ -116,11 +171,25 @@ def parse_args():
     parser.add_argument("--study_prefix", default="ithp", type=str)
     parser.add_argument("--tpe_startup_trials", default=10, type=int)
     parser.add_argument("--early_stopping_patience", default=None, type=int)
+    parser.add_argument(
+        "--base_model",
+        type=str,
+        default=None,
+        help="If set, forwarded as ``--model`` to train.py (e.g. local bert-base-chinese path).",
+    )
     args = parser.parse_args()
+    if args.random_trials is None:
+        args.random_trials = 20 if args.dataset == "simsv2" else 50
+    if args.tpe_trials is None:
+        args.tpe_trials = 60 if args.dataset == "simsv2" else 100
     if args.n_epochs is None:
         args.n_epochs = default_n_epochs(args.dataset)
     if args.early_stopping_patience is None:
         args.early_stopping_patience = default_early_stopping_patience(args.dataset)
+    if args.output_dir is None:
+        args.output_dir = (
+            "log/4080_restart" if args.dataset == "simsv2" else "optuna_results"
+        )
     return args
 
 
@@ -163,7 +232,13 @@ def format_metric(metrics, metric_name):
     return f"{value:.4f}"
 
 
-def build_train_command(dataset, config, n_epochs, selection_metric, early_stopping_patience):
+def build_train_command(
+    dataset, config, n_epochs, selection_metric, early_stopping_patience, base_model=None
+):
+    if dataset == "simsv2":
+        silver_arg = ["--silver_span_cache", ""]
+    else:
+        silver_arg = ["--silver_span_cache", f"datasets/{dataset}_silver_spans.pkl"]
     command = [
         PYTHON,
         "-u",
@@ -172,8 +247,7 @@ def build_train_command(dataset, config, n_epochs, selection_metric, early_stopp
         dataset,
         "--n_epochs",
         str(n_epochs),
-        "--silver_span_cache",
-        f"datasets/{dataset}_silver_spans.pkl",
+        *silver_arg,
         "--merge_trace_samples",
         "0",
         "--selection_metric",
@@ -183,13 +257,16 @@ def build_train_command(dataset, config, n_epochs, selection_metric, early_stopp
     ]
     for key, value in config.items():
         command.extend([f"--{key}", str(value)])
+    if base_model:
+        command.extend(["--model", str(base_model)])
     return command
 
 
-def suggest_config(trial):
+def suggest_config(trial, dataset):
+    space = SEARCH_SPACE_SIMSV2 if dataset == "simsv2" else SEARCH_SPACE_DEFAULT
     return {
         name: trial.suggest_categorical(name, choices)
-        for name, choices in SEARCH_SPACE.items()
+        for name, choices in space.items()
     }
 
 
@@ -256,7 +333,7 @@ def write_artifacts(study, output_dir, primary_metric):
 
 
 def run_trial(trial, args, phase_name, work_dir, output_dir):
-    config = suggest_config(trial)
+    config = suggest_config(trial, args.dataset)
     phase_dir = output_dir / "trial_logs" / phase_name
     phase_dir.mkdir(parents=True, exist_ok=True)
     log_path = phase_dir / f"trial_{trial.number:04d}.log"
@@ -273,6 +350,7 @@ def run_trial(trial, args, phase_name, work_dir, output_dir):
         args.n_epochs,
         args.selection_metric,
         args.early_stopping_patience,
+        base_model=args.base_model,
     )
 
     print(f"[{phase_name}][Trial {trial.number}] Config: {config}")
@@ -308,7 +386,7 @@ def run_trial(trial, args, phase_name, work_dir, output_dir):
     print(
         f"[{phase_name}][Trial {trial.number}] DONE in {elapsed:.0f}s — "
         f"{args.primary_metric}={format_metric(metrics, args.primary_metric)}, "
-        f"f1_no_zero={format_metric(metrics, 'f1_score_no_zero')}, "
+        f"f1_or_F1={format_metric(metrics, 'f1_score_no_zero')}, "
         f"mae={metrics.get('mae', 'NA')}, best_epoch={metrics.get('best_epoch', 'NA')}"
     )
 
