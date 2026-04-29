@@ -1,74 +1,103 @@
-# Recursive Information-Theoretic Hierarchical Perception (Recursive-ITHP)
+# Recursive-ITHP
 
-This repository hosts the **Recursive-ITHP** project, which fundamentally upgrades the Information-Theoretic Hierarchical Perception (ITHP) framework by introducing **Dynamic Recursive Perception**.
+**Recursive Information Theoretical Halting Process (Recursive-ITHP)** extends the ITHP multimodal fusion idea with a **learned halting** mechanism: the model may stop early when the latent state is sufficient, or recurse deeper when integrating audio / video under Information Bottleneck-style objectives.
 
-## 📖 The Story & Problem Solved
+Upstream ITHP reference: [joshuaxiao98/ITHP](https://github.com/joshuaxiao98/ITHP). This fork adds regression and classification paths, **CH-SIMS v2**, and **Optuna** tooling.
 
-### The Bottleneck in Traditional Multimodal Fusion
-Traditional multimodal learning models (such as those attempting sentiment analysis or sarcasm detection by combining Text, Audio, and Video) treat all modalities as equals. They fuse everything simultaneously using massive attention networks or feature concatenation. This causes two fatal issues:
-1. **Information Redundancy & Noise:** Introducing raw visual and acoustic features alongside text often pollutes the latent space with irrelevant noise (e.g., background noise or unimportant facial twitches) rather than helping the prediction.
-2. **Violation of Cognitive Physics:** The human brain does not process all senses equally at the exact same moment. It establishes a primary sensory pathway and pulls from other senses only to verify or supplement ambiguous information.
+## What is in this repository
 
-### The Original ITHP Solution
-The original ITHP model solved this by proposing a **Hierarchical Perception** inspired by neuroscience. It assigned a "Prime Modality" (usually Text) and treated secondary modalities (Audio/Video) merely as "Detectors." Using the **Information Bottleneck (IB)** theory, it forcibly filtered out noise by maximizing the mutual information with the secondary modalities while strictly minimizing redundant mutual information from the primary input. 
+- **CMU-MOSI / CMU-MOSEI**: recursive sentiment training (`train.py`), silver-span syntax losses where applicable, KuDA-style test metrics.
+- **CH-SIMS v2 (`simsv2`)**: MMSA-style pickled features, `bert-base-chinese` (or local weights via `--model`), normalization helpers in `simsv2_data.py`, metrics in `simsv2_metrics.py`.
+- **MUStARD / UR-FUNNY**: HKT-paper-style binary classification (`train_hkt_binary.py`) and Optuna driver `scripts/optuna_hkt_search.py` (ALBERT / pickle splits).
+- **Hyperparameter search**: two-phase Random + TPE Optuna studies (`scripts/optuna_search.py` for `mosi` / `mosei` / `simsv2`; SQLite storage, resumable).
+- **Paper draft assets**: `recursive_ITHP_manuscript/` (LaTeX), `baseline_table.tex` (baseline grids; build PDFs locally, not committed).
 
-### 🚀 Our Innovation: The "Recursive" Awakening
-However, the original ITHP had a critical limitation: **its hierarchical depth was static and rigid.** 
-Every sample, whether it was an obvious positive comment or a deeply masked sarcastic remark, went through the exact same processing depth. 
+## Requirements
 
-**Recursive-ITHP** solves this computational and cognitive rigidity by introducing **Dynamic Recursive Distillation**.
-* **Dynamic Halting Mechanism:** We introduced a recursive semantic tree that acts dynamically. By utilizing a `halting_threshold`, the model evaluates the confidence of its latent state at each step. 
-* **Adaptive Depth:** If the prime modality and a shallow fusion provide enough confidence for an obvious sample, the model **stops early**, saving computation and preventing overfitting. If a sentence is highly ambiguous (like complex sarcasm), the model recursively dives deeper, extracting secondary modality features multiple times (`max_recursion_depth`) until the Information Bottleneck is satisfied.
-* **Syntax and Semantic Trees Integration:** Advanced syntax-aware losses and structural recursion deeply intertwine with the IB framework.
+Python 3.x, PyTorch, and dependencies from `requirements.txt`. An internal environment name used in scripts is `ITHP5090` (adjust paths in `scripts/optuna_search.py` if needed).
 
-## 🏆 Performance Breakthroughs
-By letting the model recursively decide its "thinking depth" (`avg_steps` usually hovering around 2.5 ~ 3.5), we achieved historic breakthroughs across major multimodal benchmarks:
+## Quick start
 
-- **CMU-MOSI**: Achieved an unprecedented **Test MAE of < 0.60** (Top 0.594) with **88.39% Binary Accuracy**.
-- **CMU-MOSEI**: Reached an incredibly low **Test MAE of < 0.51** (Top 0.502) with **87.54% Accuracy**.
-- **MUStARD & UR-FUNNY**: Extended to complex sarcasm and humor detection tasks using specialized HKT binary pipelines.
-
-## 🛠️ Quick Start
-
-### 1. Installation
-Clone the repository and install dependencies tailored to the `ITHP5090` optimized environment:
+Clone (default branch or `regress_class_optuna`):
 
 ```bash
-git clone https://github.com/[your-repo]/Recursive-ITHP.git
-cd Recursive-ITHP
+git clone https://github.com/cheung20050509-prog/recursive_nlp.git
+cd recursive_nlp
 pip install -r requirements.txt
 ```
 
-### 2. Standard Training (MOSI / MOSEI)
-Train the recursive model on standard CMU datasets:
+### Train (examples)
 
 ```bash
-python train.py --dataset mosi   
-python train.py --dataset mosei 
+# CMU sentiment (BERT-base English features + recursive ITHP)
+python train.py --dataset mosi
+python train.py --dataset mosei
+
+# CH-SIMS v2 — use MMSA-normalized pickle; pass Chinese BERT path
+python train.py --dataset simsv2 --model /path/to/bert-base-chinese
 ```
 
-### 3. Sarcasm & Humor Detection (MUStARD / UR-FUNNY)
-We provide a dedicated HKT-style entry point for binary sarcasm/humor classification. This pipeline cleanly consumes HCF sequences and utilizes `BCEWithLogitsLoss`:
+### HKT binary (humor / sarcasm)
 
 ```bash
 python train_hkt_binary.py --dataset mustard --train_batch_size 32
 python train_hkt_binary.py --dataset urfunny --train_batch_size 32
 ```
 
-### 4. Optuna Hyperparameter Search
-The dynamic mechanics of recursion (e.g., `halting_threshold`, `syntax_temperature`, `max_recursion_depth`) are highly sensitive. We provide extensive `optuna` search scripts equipped with dual-phase TPE discrete searches. 
-Optuna supports `load_if_exists=True`, allowing seamless background resume capabilities via SQLite.
+### Optuna
 
 ```bash
-# Global broad search
-python scripts/optuna_search.py --dataset mosei --gpu 0 --output_dir optuna_results_mae
+# MOSI / MOSEI (default output roots differ; override with --output_dir)
+python scripts/optuna_search.py --dataset mosei --gpu 0
 
-# Local refined search around the best anchor config
-python scripts/optuna_local_refine_search.py --dataset mosi --gpu 1 --output_dir optuna_results_local_refine
+# SIMSv2 — defaults include smaller trial counts and CH-specific search space;
+# default --output_dir is log/4080_restart (study DB under log/4080_restart/simsv2/)
+python scripts/optuna_search.py --dataset simsv2 --gpu 0 --primary_metric mae
 ```
 
-## 🧬 Framework Details
+HKT classification search:
 
-- **`Recursive_ITHP.py` / `ITHP.py`**: The core models containing the Recursive Information Bottleneck logic.
-- **`optuna_*.py`**: Scripts responsible for aggressively tuning the recursive depths and loss weights.
-- **`train_hkt_binary.py`**: Specialized trainer adapting the recursive logic to binary tasks on heavily skewed datasets.
+```bash
+python scripts/optuna_hkt_search.py --help
+```
+
+SIMSv2 pickle preparation (when building from raw MMSA assets):
+
+```bash
+python scripts/build_simsv2_ithp_pkl.py --help
+bash scripts/download_bert_chinese.sh   # optional local weights
+```
+
+## Results (indicative)
+
+Numbers depend on split, seed, and Optuna budget. Recent Optuna-best **test** checkpoints are roughly:
+
+| Dataset | Notes |
+|--------|--------|
+| **MOSI** | Strong **MAE / Corr** vs many published rows; Acc2/F1 competitive with top baselines (see `baseline_table.tex`). |
+| **MOSEI** | **MAE / Corr** competitive; not every Acc column leads the public table. |
+| **CH-SIMS v2** | Solid run; **KuDA-class rows remain ahead** on several columns — report as an extra Chinese benchmark, not blanket SOTA. |
+| **MUStARD / UR-FUNNY** | HKT-fair pipeline; test accuracy still **below published MOAC** on the same-style table — useful for coverage or appendix. |
+
+Treat `baseline_table.tex` as the single source for the exact figures you cite in the paper.
+
+## Layout
+
+| Path | Role |
+|------|------|
+| `train.py` | Main MOSI/MOSEI/SIMSv2 trainer |
+| `train_hkt_binary.py` | MUStARD / UR-FUNNY binary trainer |
+| `Recursive_ITHP.py`, `ITHP.py` | Model cores |
+| `simsv2_data.py`, `simsv2_metrics.py` | SIMSv2 IO / metrics |
+| `global_configs.py` | Shared knobs |
+| `scripts/optuna_search.py` | Optuna for mosi / mosei / simsv2 |
+| `scripts/optuna_hkt_search.py` | Optuna for HKT datasets |
+| `log/` | Ignored by git — store Optuna DBs and trial logs here |
+
+## Branching
+
+Active development for regression, classification, and Optuna integration lives on **`regress_class_optuna`**.
+
+## License
+
+Follow the license of the upstream ITHP project unless otherwise specified in this repository.
