@@ -1,0 +1,29 @@
+{
+  "description": "Dual anchors for MOSI local-refine / neighborhood search. Anchor A: backup study best (test MAE ~0.587). Anchor B: log/4080_restart/mosi best valid trial (test MAE ~0.603).",
+  "anchor_A_backup_trial31": {
+    "source": "log/backup_pre_4080_restart_20260424_000954/optuna_results_local_refine_mae_boundary_expand_moretrials_20260419_213850/mosi/study_summary.json trial 31",
+    "learning_rate": 2e-05,
+    "p_beta": 4,
+    "p_gamma": 16,
+    "B0_dim": 64,
+    "B1_dim": 128,
+    "max_recursion_depth": 4,
+    "halting_threshold": 0.02,
+    "dropout_prob": 0.5,
+    "silver_span_loss_weight": 0.2,
+    "syntax_temperature": 0.5
+  },
+  "anchor_B_4080_restart_trial33": {
+    "source": "log/4080_restart/mosi/study_summary.json trial 33",
+    "learning_rate": 2e-05,
+    "p_beta": 8,
+    "p_gamma": 16,
+    "B0_dim": 64,
+    "B1_dim": 32,
+    "max_recursion_depth": 3,
+    "halting_threshold": 0.04,
+    "dropout_prob": 0.5,
+    "silver_span_loss_weight": 0.05,
+    "syntax_temperature": 0.5
+  }
+}

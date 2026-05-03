@@ -1,16 +1,18 @@
 #!/usr/bin/env python
-"""Two-phase Optuna search for ITHP recursive model.
+"""Two-phase Optuna search for ITHP / RITHP (recursive) model.
 
-Phase 1 uses RandomSampler for broad exploration.
-Phase 2 reuses the same Optuna study with TPESampler for stronger search.
+Phase 1 uses RandomSampler; phase 2 reuses the study with TPESampler.
 
-CH-SIMSv2 (``--dataset simsv2``): defaults tuned for BERT-Chinese regression —
-``n_epochs=25``, ``early_stopping_patience=4``, ``random_trials=20``,
-``tpe_trials=60`` (80 trials total), ``SEARCH_SPACE_SIMSV2`` (no silver spans;
-``silver_span_loss_weight`` fixed to 0; extra ``train.py`` knobs). Use
-``--base_model /path/to/bert-base-chinese`` to pin weights. MOSI/MOSEI keep the
-original grid and 50+100 trials unless overridden. Default ``--output_dir`` for
-``simsv2`` is ``log/4080_restart`` (study lives under ``.../log/4080_restart/simsv2/``).
+SIMSv2 (``--dataset simsv2``): default ``--simsv2-search-space aligned`` uses the
+same categorical grid as MOSI/MOSEI (50+100 trials by default). If
+``datasets/simsv2_silver_spans.pkl`` is missing, ``silver_span_loss_weight`` is
+restricted to ``[0.0]`` until you run ``scripts/build_simsv2_silver_span_cache.py``.
+Use ``--simsv2-search-space wide`` for the legacy extra-hparam grid (20+60 defaults).
+Prefer a new ``--study_prefix`` or ``--output_dir`` when switching space. Default
+``--output_dir`` for simsv2 is ``log/4080_restart``.
+
+Optional: ``--silver-span-loss-weight-sampling uniform`` samples the weight with
+``suggest_float`` in ``[0, --silver-span-loss-weight-high]`` (new study only).
 """
 
 import argparse
@@ -30,21 +32,20 @@ GRACEFUL_STOP_SIGNAL = None
 
 # MOSI / MOSEI (silver span cache + regression / acc7 auxiliary).
 SEARCH_SPACE_DEFAULT = {
-    "learning_rate": [5e-6, 1e-5, 2e-5, 3e-5],
+    "learning_rate": [5e-6, 1e-5, 1.5e-5, 2e-5, 3e-5],
     "p_beta": [4, 8, 16],
     "p_gamma": [16, 32, 64],
     "B0_dim": [64, 128, 256],
     "B1_dim": [32, 64, 128],
     "max_recursion_depth": [3, 4, 5],
-    "halting_threshold": [0.02, 0.0285, 0.04, 0.06],
+    "halting_threshold": [0.015, 0.02, 0.025, 0.0285, 0.04, 0.06],
     "dropout_prob": [0.3, 0.5],
-    "silver_span_loss_weight": [0.05, 0.1, 0.2],
+    "silver_span_loss_weight": [0.05, 0.1, 0.15, 0.2],
     "syntax_temperature": [0.5, 1.0, 2.0],
 }
 
-# CH-SIMSv2: no silver cache; keep syntax_temperature; fix silver span loss to 0;
-# add schedule / IB-adjacent knobs aligned with ``train.py`` CLI.
-SEARCH_SPACE_SIMSV2 = {
+# CH-SIMSv2 legacy / ablation: extra knobs not used for MOSI/MOSEI Optuna grid.
+SEARCH_SPACE_SIMSV2_WIDE = {
     "learning_rate": [5e-6, 1e-5, 2e-5, 3e-5],
     "p_beta": [4, 8, 16],
     "p_gamma": [16, 32, 64],
@@ -142,13 +143,13 @@ def parse_args():
         "--random_trials",
         default=None,
         type=int,
-        help="Random phase trials (default: 50 mosi/mosei, 20 simsv2).",
+        help="Random phase trials (default: 50; simsv2 wide-only: 20).",
     )
     parser.add_argument(
         "--tpe_trials",
         default=None,
         type=int,
-        help="TPE phase trials (default: 100 mosi/mosei, 60 simsv2).",
+        help="TPE phase trials (default: 100; simsv2 wide-only: 60).",
     )
     parser.add_argument("--n_epochs", default=None, type=int)
     parser.add_argument("--seed", default=128, type=int)
@@ -177,11 +178,39 @@ def parse_args():
         default=None,
         help="If set, forwarded as ``--model`` to train.py (e.g. local bert-base-chinese path).",
     )
+    parser.add_argument(
+        "--simsv2-search-space",
+        choices=["aligned", "wide"],
+        default="aligned",
+        help="SIMSv2 only: aligned = MOSI/MOSEI categorical grid; wide = legacy extra hparams.",
+    )
+    parser.add_argument(
+        "--silver-span-loss-weight-sampling",
+        choices=["categorical", "uniform"],
+        default="categorical",
+        help=(
+            "categorical: discrete grid in SEARCH_SPACE_DEFAULT. "
+            "uniform: suggest_float in [0, --silver-span-loss-weight-high] when cache allows non-zero weights. "
+            "Requires a new --study_prefix — incompatible with studies that used categorical silver weights."
+        ),
+    )
+    parser.add_argument(
+        "--silver-span-loss-weight-high",
+        default=0.25,
+        type=float,
+        help="Upper bound for uniform silver_span_loss_weight (train.py); lower bound is 0.",
+    )
     args = parser.parse_args()
     if args.random_trials is None:
-        args.random_trials = 20 if args.dataset == "simsv2" else 50
+        if args.dataset == "simsv2" and args.simsv2_search_space == "wide":
+            args.random_trials = 20
+        else:
+            args.random_trials = 50
     if args.tpe_trials is None:
-        args.tpe_trials = 60 if args.dataset == "simsv2" else 100
+        if args.dataset == "simsv2" and args.simsv2_search_space == "wide":
+            args.tpe_trials = 60
+        else:
+            args.tpe_trials = 100
     if args.n_epochs is None:
         args.n_epochs = default_n_epochs(args.dataset)
     if args.early_stopping_patience is None:
@@ -190,6 +219,8 @@ def parse_args():
         args.output_dir = (
             "log/4080_restart" if args.dataset == "simsv2" else "optuna_results"
         )
+    if args.silver_span_loss_weight_sampling == "uniform" and args.silver_span_loss_weight_high <= 0:
+        raise SystemExit("--silver-span-loss-weight-high must be > 0 when using uniform silver weight sampling")
     return args
 
 
@@ -233,10 +264,21 @@ def format_metric(metrics, metric_name):
 
 
 def build_train_command(
-    dataset, config, n_epochs, selection_metric, early_stopping_patience, base_model=None
+    dataset,
+    config,
+    n_epochs,
+    selection_metric,
+    early_stopping_patience,
+    base_model=None,
+    work_dir: Path | None = None,
 ):
+    wd = work_dir or Path(".")
     if dataset == "simsv2":
-        silver_arg = ["--silver_span_cache", ""]
+        cache_rel = "datasets/simsv2_silver_spans.pkl"
+        if (wd / cache_rel).is_file():
+            silver_arg = ["--silver_span_cache", cache_rel]
+        else:
+            silver_arg = ["--silver_span_cache", ""]
     else:
         silver_arg = ["--silver_span_cache", f"datasets/{dataset}_silver_spans.pkl"]
     command = [
@@ -262,12 +304,60 @@ def build_train_command(
     return command
 
 
-def suggest_config(trial, dataset):
-    space = SEARCH_SPACE_SIMSV2 if dataset == "simsv2" else SEARCH_SPACE_DEFAULT
-    return {
-        name: trial.suggest_categorical(name, choices)
-        for name, choices in space.items()
-    }
+def resolve_search_space(dataset: str, args, work_dir: Path) -> dict:
+    """SIMSv2 aligned uses MOSI/MOSEI grid; silver weights need simsv2 silver cache."""
+    if dataset != "simsv2":
+        return SEARCH_SPACE_DEFAULT
+    if args.simsv2_search_space == "wide":
+        return SEARCH_SPACE_SIMSV2_WIDE
+    space = dict(SEARCH_SPACE_DEFAULT)
+    cache_path = work_dir / "datasets" / "simsv2_silver_spans.pkl"
+    if not cache_path.is_file():
+        space["silver_span_loss_weight"] = [0.0]
+    return space
+
+
+def _merge_frozen_categorical_distributions(study: optuna.Study, space: dict) -> dict:
+    """Align categorical ``choices`` with distributions already stored in the study.
+
+    Optuna forbids changing categorical value lists when resuming the same sqlite
+    (e.g. code later added ``0.15`` to ``silver_span_loss_weight`` while old trials
+    used ``(0.05, 0.1, 0.2)``). For each param, the first observed
+    ``CategoricalDistribution`` in prior trials wins.
+    """
+    frozen: dict[str, tuple] = {}
+    for t in study.trials:
+        for name, dist in (t.distributions or {}).items():
+            if name in frozen or not hasattr(dist, "choices"):
+                continue
+            frozen[name] = tuple(dist.choices)
+    if not frozen:
+        return space
+    merged = dict(space)
+    for name, choices in frozen.items():
+        if name not in merged:
+            continue
+        cur = merged[name]
+        if isinstance(cur, (list, tuple)) and tuple(cur) != choices:
+            merged[name] = list(choices)
+    return merged
+
+
+def suggest_config(trial, args, work_dir: Path):
+    space = resolve_search_space(args.dataset, args, work_dir)
+    space = _merge_frozen_categorical_distributions(trial.study, space)
+    use_uniform_silver = (
+        args.silver_span_loss_weight_sampling == "uniform"
+        and len(space.get("silver_span_loss_weight", [0.0])) > 1
+    )
+    if use_uniform_silver:
+        space = dict(space)
+        space.pop("silver_span_loss_weight", None)
+    config = {name: trial.suggest_categorical(name, choices) for name, choices in space.items()}
+    if use_uniform_silver:
+        hi = float(args.silver_span_loss_weight_high)
+        config["silver_span_loss_weight"] = trial.suggest_float("silver_span_loss_weight", 0.0, hi)
+    return config
 
 
 def count_completed_trials(study, phase_name):
@@ -333,7 +423,7 @@ def write_artifacts(study, output_dir, primary_metric):
 
 
 def run_trial(trial, args, phase_name, work_dir, output_dir):
-    config = suggest_config(trial, args.dataset)
+    config = suggest_config(trial, args, work_dir)
     phase_dir = output_dir / "trial_logs" / phase_name
     phase_dir.mkdir(parents=True, exist_ok=True)
     log_path = phase_dir / f"trial_{trial.number:04d}.log"
@@ -351,6 +441,7 @@ def run_trial(trial, args, phase_name, work_dir, output_dir):
         args.selection_metric,
         args.early_stopping_patience,
         base_model=args.base_model,
+        work_dir=work_dir,
     )
 
     print(f"[{phase_name}][Trial {trial.number}] Config: {config}")
@@ -432,6 +523,24 @@ def main():
     work_dir = Path(__file__).resolve().parent.parent
     os.chdir(work_dir)
 
+    if args.dataset == "simsv2" and args.simsv2_search_space == "aligned":
+        _silver = work_dir / "datasets" / "simsv2_silver_spans.pkl"
+        if not _silver.is_file():
+            print(
+                "NOTICE: aligned simsv2 search — datasets/simsv2_silver_spans.pkl not found; "
+                "silver_span_loss_weight is restricted to [0.0]. Build cache with:\n"
+                "  python scripts/build_simsv2_silver_span_cache.py --input datasets/simsv2.pkl "
+                "--output datasets/simsv2_silver_spans.pkl",
+                flush=True,
+            )
+        print(
+            "TIP: If resuming an older sqlite built with --simsv2-search-space wide, "
+            "use a new --study_prefix or --output_dir for a clean aligned study.",
+            flush=True,
+        )
+    elif args.dataset == "simsv2":
+        print("NOTICE: simsv2 --simsv2-search-space wide (legacy extra hparams).", flush=True)
+
     output_dir = Path(args.output_dir) / args.dataset
     output_dir.mkdir(parents=True, exist_ok=True)
     storage_path = (output_dir / "optuna_study.sqlite3").resolve()
@@ -446,6 +555,21 @@ def main():
     print(f"Selection metric: {args.selection_metric} (minimize)")
     print(f"Epochs per trial: {args.n_epochs}")
     print(f"Early stopping patience: {args.early_stopping_patience}")
+    print(
+        f"silver_span_loss_weight sampling: {args.silver_span_loss_weight_sampling}"
+        + (
+            f" (uniform [0, {args.silver_span_loss_weight_high}])"
+            if args.silver_span_loss_weight_sampling == "uniform"
+            else ""
+        ),
+        flush=True,
+    )
+    if args.dataset == "simsv2":
+        print(
+            f"SIMSv2: --simsv2-search-space={args.simsv2_search_space}, "
+            f"random_trials={args.random_trials}, tpe_trials={args.tpe_trials}",
+            flush=True,
+        )
 
     random_sampler = optuna.samplers.RandomSampler(seed=args.seed)
     study = run_phase(

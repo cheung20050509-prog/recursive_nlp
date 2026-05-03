@@ -8,7 +8,7 @@ Upstream ITHP reference: [joshuaxiao98/ITHP](https://github.com/joshuaxiao98/ITH
 
 - **CMU-MOSI / CMU-MOSEI**: **RITHM** sentiment training (`train.py`), silver-span syntax losses where applicable, KuDA-style test metrics.
 - **CH-SIMS v2 (`simsv2`)**: MMSA-style pickled features, `bert-base-chinese` (or local weights via `--model`), normalization helpers in `simsv2_data.py`, metrics in `simsv2_metrics.py`.
-- **MUStARD / UR-FUNNY**: HKT-paper-style binary classification (`train_hkt_binary.py`) and Optuna driver `scripts/optuna_hkt_search.py` (ALBERT / pickle splits).
+- **MUStARD / UR-FUNNY**: HKT-paper-style binary classification (`train_hkt_binary.py`) and Optuna driver `scripts/optuna_hkt_search.py` (ALBERT / pickle splits). Optional **benepar silver constituency spans** on the **target utterance** (see silver coverage matrix below).
 - **Hyperparameter search**: two-phase Random + TPE Optuna studies (`scripts/optuna_search.py` for `mosi` / `mosei` / `simsv2`; SQLite storage, resumable).
 - **Paper draft assets**: `recursive_ITHP_manuscript/` (LaTeX), `baseline_table.tex` (baseline grids; build PDFs locally, not committed).
 
@@ -47,13 +47,43 @@ python train_hkt_binary.py --dataset urfunny --train_batch_size 32
 ### Optuna
 
 ```bash
-# MOSI / MOSEI (default output roots differ; override with --output_dir)
+# MOSI / MOSEI
 python scripts/optuna_search.py --dataset mosei --gpu 0
 
-# SIMSv2 — defaults include smaller trial counts and CH-specific search space;
-# default --output_dir is log/4080_restart (study DB under log/4080_restart/simsv2/)
+# SIMSv2 — default --simsv2-search-space aligned: same categorical grid as MOSI/MOSEI
+# (50 random + 100 TPE trials unless overridden). Default --output_dir log/4080_restart.
 python scripts/optuna_search.py --dataset simsv2 --gpu 0 --primary_metric mae
+
+# Legacy SIMSv2 grid (extra IB/schedule knobs; 20+60 trial defaults)
+python scripts/optuna_search.py --dataset simsv2 --gpu 0 --simsv2-search-space wide
 ```
+
+**SIMSv2 silver spans (aligned search):** Optuna matches MOSI/MOSEI on `silver_span_loss_weight` only when `datasets/simsv2_silver_spans.pkl` exists. Otherwise weights are restricted to `0.0`. Build the cache (benepar + normalized pickle; Chinese text may need a non-English parser model — see script docstring):
+
+```bash
+python scripts/build_simsv2_silver_span_cache.py --input datasets/simsv2.pkl \
+  --output datasets/simsv2_silver_spans.pkl --parser-model benepar_en3 --device cpu
+```
+
+### Silver span coverage (cache + supervised syntax loss)
+
+| Training entry | Dataset | Silver constituency cache | Span supervision in the model |
+|----------------|---------|----------------------------|------------------------------|
+| `train.py` | MOSI, MOSEI | `datasets/{dataset}_silver_spans.pkl` (or `--silver_span_cache`) | Yes: `silver_span_loss_weight * syntax_loss` when a cache is loaded |
+| `train.py` | simsv2 | Optional: `scripts/build_simsv2_silver_span_cache.py` → `datasets/simsv2_silver_spans.pkl` | Same as above; Optuna restricts `silver_span_loss_weight` to `[0.0]` if the pickle is missing |
+| `train_hkt_binary.py` | mustard, urfunny | Optional: `scripts/build_hkt_silver_span_cache.py` → `datasets/{mustard,urfunny}_silver_spans.pkl` | Yes when a cache is loaded: pass `--syntax_loss_weight` (same role as MOSI **`silver_span_loss_weight`**; there is no separate HKT flag name). `--syntax_loss_weight > 0` requires a readable cache. |
+
+**HKT cache build** (English benepar default `benepar_en3`; use the same `--fold` / `--dataset_cache` / `--seed` / `--dev_ratio` as training when you rely on MUStARD k-fold or a custom pickle):
+
+```bash
+python scripts/build_hkt_silver_span_cache.py --dataset mustard
+python scripts/build_hkt_silver_span_cache.py --dataset mustard --fold 0 --seed 5149 --dev-ratio 0.1
+python scripts/build_hkt_silver_span_cache.py --dataset urfunny
+```
+
+**HKT Optuna:** `scripts/optuna_hkt_search.py` includes `syntax_loss_weight` in its search space; if `datasets/<dataset>_silver_spans.pkl` is missing, the driver prints a notice and restricts `syntax_loss_weight` to `[0.0]` (same idea as SIMSv2 aligned search).
+
+**Study sqlite:** Switching between `aligned` and `wide` changes suggested parameter names; reuse the same `optuna_study.sqlite3` only if you know what you are doing. Prefer a new `--study_prefix` or `--output_dir` for a clean aligned run.
 
 HKT classification search:
 
@@ -91,6 +121,8 @@ Treat `baseline_table.tex` as the single source for the exact figures you cite i
 | `simsv2_data.py`, `simsv2_metrics.py` | SIMSv2 IO / metrics |
 | `global_configs.py` | Shared knobs |
 | `scripts/optuna_search.py` | Optuna for mosi / mosei / simsv2 |
+| `scripts/build_simsv2_silver_span_cache.py` | Normalize SIMSv2 pickle + benepar silver cache |
+| `scripts/build_hkt_silver_span_cache.py` | Benepar silver cache for MUStARD / UR-FUNNY HKT pickles |
 | `scripts/optuna_hkt_search.py` | Optuna for HKT datasets |
 | `log/` | Ignored by git — store Optuna DBs and trial logs here |
 

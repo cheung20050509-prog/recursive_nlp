@@ -79,6 +79,18 @@ from hkt_data import (
     load_hkt_dataset,
     normalize_dataset_name,
 )
+from silver_span_utils import (
+    build_pair_target_syntax_span_mask,
+    get_silver_span_record,
+    load_hkt_silver_span_cache,
+    resolve_hkt_silver_span_cache_path,
+    target_words_from_p_field,
+    tokenize_word_list,
+)
+
+# argparse: omit --syntax_loss_weight to use auto rule in main (see below).
+_SYNTAX_LOSS_WEIGHT_ARG_DEFAULT = object()
+_SILVER_SPAN_SYNTAX_DEFAULT = 0.1
 
 
 def parse_args():
@@ -125,7 +137,28 @@ def parse_args():
     parser.add_argument("--syntax_temperature", default=1.0, type=float)
     parser.add_argument("--ib_loss_weight", default=-1.0, type=float,
                         help="If negative, defaults to 2/(p_beta+p_gamma).")
-    parser.add_argument("--syntax_loss_weight", default=0.0, type=float)
+    parser.add_argument(
+        "--syntax_loss_weight",
+        default=_SYNTAX_LOSS_WEIGHT_ARG_DEFAULT,
+        type=float,
+        help=(
+            "Weight on constituency span supervision (same as train.py silver_span_loss_weight). "
+            "If omitted: 0.1 when datasets/<dataset>_silver_spans.pkl exists for urfunny, or for "
+            "mustard with --fold -1 (official pickle split); else 0.0. MUStARD k-fold (--fold>=0) "
+            "stays 0.0 unless you pass this flag and a fold-aligned silver cache."
+        ),
+    )
+    parser.add_argument(
+        "--silver_span_cache",
+        type=str,
+        default="",
+        help=(
+            "Path to a benepar silver span pickle (train/dev/test). "
+            "When empty, uses datasets/<dataset>_silver_spans.pkl if present. "
+            "Same role as train.py --silver_span_cache; pairs with --syntax_loss_weight "
+            "(MOSI naming: silver_span_loss_weight)."
+        ),
+    )
     parser.add_argument("--hcf_dim", default=HCF_DIM, type=int)
     parser.add_argument("--disable_hcf", action="store_true",
                         help="Ignore HCF features even if present in the pickle.")
@@ -249,6 +282,29 @@ def _resolve_backbone_name(args):
 
 args = parse_args()
 
+_resolved_silver = resolve_hkt_silver_span_cache_path(args.dataset, args.silver_span_cache)
+if args.syntax_loss_weight is _SYNTAX_LOSS_WEIGHT_ARG_DEFAULT:
+    _silver_ok = bool(_resolved_silver and os.path.isfile(_resolved_silver))
+    if args.dataset == "urfunny" and _silver_ok:
+        args.syntax_loss_weight = _SILVER_SPAN_SYNTAX_DEFAULT
+    elif args.dataset == "mustard" and args.fold < 0 and _silver_ok:
+        args.syntax_loss_weight = _SILVER_SPAN_SYNTAX_DEFAULT
+    else:
+        args.syntax_loss_weight = 0.0
+    if args.syntax_loss_weight > 0.0:
+        print(
+            "HKT_SILVER_SPAN: auto-enabled --syntax_loss_weight={} (cache={})".format(
+                args.syntax_loss_weight, _resolved_silver
+            ),
+            flush=True,
+        )
+if args.syntax_loss_weight > 0.0 and (not _resolved_silver or not os.path.isfile(_resolved_silver)):
+    raise ValueError(
+        "When --syntax_loss_weight > 0, a readable silver span cache is required. "
+        "Build with:\n  python scripts/build_hkt_silver_span_cache.py --dataset "
+        f"{args.dataset}\nor pass --silver_span_cache to an existing pickle."
+    )
+
 global_configs.MAX_RECURSION_DEPTH = args.max_recursion_depth
 dataset_config_key = args.dataset if args.feature_dim_mode == "subset" else f"{args.dataset}_full"
 global_configs.set_dataset_config(dataset_config_key)
@@ -256,7 +312,7 @@ ACOUSTIC_DIM, VISUAL_DIM = global_configs.ACOUSTIC_DIM, global_configs.VISUAL_DI
 
 
 class InputFeatures(object):
-    def __init__(self, input_ids, visual, acoustic, hcf, input_mask, segment_ids, label_id):
+    def __init__(self, input_ids, visual, acoustic, hcf, input_mask, segment_ids, label_id, syntax_span_mask):
         self.input_ids = input_ids
         self.visual = visual
         self.acoustic = acoustic
@@ -264,6 +320,7 @@ class InputFeatures(object):
         self.input_mask = input_mask
         self.segment_ids = segment_ids
         self.label_id = label_id
+        self.syntax_span_mask = syntax_span_mask
 
 
 def set_random_seed(seed: int):
@@ -358,10 +415,10 @@ def prepare_deberta_pair_input(
     return input_ids, visual, acoustic, hcf, input_mask, segment_ids
 
 
-def convert_hkt_examples_to_features(examples, tokenizer):
+def convert_hkt_examples_to_features(examples, tokenizer, silver_split_records=None):
     features = []
 
-    for example in examples:
+    for ex_index, example in enumerate(examples):
         (
             (p_words, p_visual, p_acoustic, p_hcf),
             (c_words, c_visual, c_acoustic, c_hcf),
@@ -370,16 +427,22 @@ def convert_hkt_examples_to_features(examples, tokenizer):
         ) = example
 
         text_a = ". ".join(c_words) if isinstance(c_words, (list, tuple)) else str(c_words)
-        text_b = (p_words + ".") if isinstance(p_words, str) else (" ".join(p_words) + ".")
         tokens_a = tokenizer.tokenize(text_a)
-        tokens_b = tokenizer.tokenize(text_b)
+
+        use_silver = silver_split_records is not None
+        if use_silver:
+            words_tgt = target_words_from_p_field(p_words)
+            tokens_b, inversions_b = tokenize_word_list(words_tgt, tokenizer)
+        else:
+            text_b = (p_words + ".") if isinstance(p_words, str) else (" ".join(p_words) + ".")
+            tokens_b = tokenizer.tokenize(text_b)
+            inversions_b = get_inversion(tokens_b)
 
         inversions_a = get_inversion(tokens_a)
-        inversions_b = get_inversion(tokens_b)
         pop_count = _truncate_context_prefix(tokens_a, tokens_b, args.max_seq_length - 3)
         # Pop the front of inversions_a so it aligns with the shorter token_a.
         inversions_a = inversions_a[pop_count:]
-        inversions_b = inversions_b[:len(tokens_b)]
+        inversions_b = inversions_b[: len(tokens_b)]
 
         visual_a = align_word_features(np.asarray(c_visual, dtype=np.float32), inversions_a, VISUAL_DIM_ALL)
         visual_b = align_word_features(np.asarray(p_visual, dtype=np.float32), inversions_b, VISUAL_DIM_ALL)
@@ -389,10 +452,14 @@ def convert_hkt_examples_to_features(examples, tokenizer):
         hcf_b = align_word_features(np.asarray(p_hcf, dtype=np.float32), inversions_b, args.hcf_dim)
 
         input_ids, visual, acoustic, hcf, input_mask, segment_ids = prepare_deberta_pair_input(
-            tokens_a, tokens_b,
-            visual_a, visual_b,
-            acoustic_a, acoustic_b,
-            hcf_a, hcf_b,
+            tokens_a,
+            tokens_b,
+            visual_a,
+            visual_b,
+            acoustic_a,
+            acoustic_b,
+            hcf_a,
+            hcf_b,
             tokenizer,
         )
 
@@ -403,6 +470,17 @@ def convert_hkt_examples_to_features(examples, tokenizer):
         assert acoustic.shape == (args.max_seq_length, ACOUSTIC_DIM)
         assert hcf.shape == (args.max_seq_length, args.hcf_dim)
 
+        if use_silver:
+            silver_record = get_silver_span_record(
+                silver_split_records, ex_index, words_tgt, str(hid)
+            )
+            offset_b = 1 + len(tokens_a) + 1
+            syntax_span_mask = build_pair_target_syntax_span_mask(
+                silver_record, inversions_b, offset_b, args.max_seq_length
+            )
+        else:
+            syntax_span_mask = np.zeros((args.max_seq_length, args.max_seq_length), dtype=np.float32)
+
         features.append(
             InputFeatures(
                 input_ids=input_ids,
@@ -412,6 +490,7 @@ def convert_hkt_examples_to_features(examples, tokenizer):
                 input_mask=input_mask,
                 segment_ids=segment_ids,
                 label_id=float(label),
+                syntax_span_mask=syntax_span_mask,
             )
         )
 
@@ -426,6 +505,7 @@ def stack_features(features):
         "hcf": np.array([f.hcf for f in features], dtype=np.float32),
         "input_mask": np.array([f.input_mask for f in features], dtype=np.int64),
         "label_id": np.array([f.label_id for f in features], dtype=np.float32),
+        "syntax_span_mask": np.array([f.syntax_span_mask for f in features], dtype=np.float32),
     }
 
 
@@ -468,6 +548,7 @@ def build_tensor_dataset(stack):
         torch.from_numpy(stack["acoustic"]).float(),
         torch.from_numpy(stack["hcf"]).float(),
         torch.from_numpy(stack["label_id"]).float(),
+        torch.from_numpy(stack["syntax_span_mask"]).float(),
     )
 
 
@@ -526,9 +607,42 @@ def set_up_data_loader():
         flush=True,
     )
 
-    train_features = convert_hkt_examples_to_features(train_examples, tokenizer)
-    dev_features = convert_hkt_examples_to_features(dev_examples, tokenizer) if dev_examples else []
-    test_features = convert_hkt_examples_to_features(test_examples, tokenizer)
+    cache_path = resolve_hkt_silver_span_cache_path(args.dataset, args.silver_span_cache)
+    silver_cache = (
+        load_hkt_silver_span_cache(cache_path)
+        if cache_path and os.path.isfile(cache_path)
+        else None
+    )
+    if silver_cache is None and cache_path:
+        print(f"HKT_SILVER_SPAN_CACHE: path not found, skipping: {cache_path}", flush=True)
+
+    def _silver_for_split(split_name: str, examples_list):
+        if silver_cache is None:
+            return None
+        records = silver_cache[split_name]
+        if isinstance(records, list):
+            return records[: len(examples_list)]
+        return records
+
+    train_features = convert_hkt_examples_to_features(
+        train_examples,
+        tokenizer,
+        silver_split_records=_silver_for_split("train", train_examples),
+    )
+    dev_features = (
+        convert_hkt_examples_to_features(
+            dev_examples,
+            tokenizer,
+            silver_split_records=_silver_for_split("dev", dev_examples),
+        )
+        if dev_examples
+        else []
+    )
+    test_features = convert_hkt_examples_to_features(
+        test_examples,
+        tokenizer,
+        silver_split_records=_silver_for_split("test", test_examples),
+    )
 
     train_stack = stack_features(train_features)
     if args.skip_normalize:
@@ -629,7 +743,7 @@ def run_epoch(model, dataloader, loss_fct, optimizer=None, scheduler=None, desc=
     iterator = tqdm(dataloader, desc=desc, leave=False)
     for step, batch in enumerate(iterator, start=1):
         batch = tuple(tensor.to(DEVICE, non_blocking=True) for tensor in batch)
-        input_ids, visual, acoustic, hcf, label_ids = batch
+        input_ids, visual, acoustic, hcf, label_ids, syntax_span_masks = batch
 
         with torch.set_grad_enabled(training):
             logits, IB_loss, kl_loss_0, mse_0, kl_loss_1, mse_1, recursive_steps, syntax_loss = model(
@@ -637,6 +751,7 @@ def run_epoch(model, dataloader, loss_fct, optimizer=None, scheduler=None, desc=
                 visual,
                 acoustic,
                 hcf=None if args.disable_hcf else hcf,
+                syntax_span_masks=syntax_span_masks,
             )
             classification_loss = loss_fct(logits.view(-1), label_ids.view(-1))
             loss = classification_loss + args.ib_loss_weight * IB_loss + args.syntax_loss_weight * syntax_loss
@@ -711,8 +826,14 @@ def main():
     if args.dry_run:
         batch = next(iter(train_loader))
         batch = tuple(tensor.to(DEVICE) for tensor in batch)
-        input_ids, visual, acoustic, hcf, label_ids = batch
-        logits, *_ = model(input_ids, visual, acoustic, hcf=None if args.disable_hcf else hcf)
+        input_ids, visual, acoustic, hcf, label_ids, syntax_span_masks = batch
+        logits, *_ = model(
+            input_ids,
+            visual,
+            acoustic,
+            hcf=None if args.disable_hcf else hcf,
+            syntax_span_masks=syntax_span_masks,
+        )
         print(f"DRY_RUN: batch={input_ids.size(0)} logits_shape={tuple(logits.shape)}", flush=True)
         return
 

@@ -140,6 +140,9 @@ def main():
     with open(args.dataset_path, "rb") as handle:
         data = pickle.load(handle)
 
+    if "dev" not in data and "valid" in data:
+        data["dev"] = data["valid"]
+
     missing_splits = [split_name for split_name in ("train", "dev", "test") if split_name not in data]
     if missing_splits:
         raise ValueError(f"Dataset pickle missing splits: {missing_splits}")

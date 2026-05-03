@@ -8,6 +8,10 @@ Phase 1:
 Phase 2:
 - build a narrowed discrete search space around the best phase-1 config, then
 - run TPE only inside that local neighborhood.
+
+MOSI: phase-1 grid and anchors follow ``scripts/mosi_dual_anchor_configs.json`` (backup
+test-strong vs 4080_restart valid-strong). Local TPE uses the **union** of categorical
+neighborhoods around both anchors so TPE does not depend on which region wins phase 1.
 """
 
 import argparse
@@ -26,47 +30,36 @@ GRACEFUL_STOP_SIGNAL = None
 
 
 SEARCH_SPACE = {
-    "learning_rate": [5e-6, 1e-5, 2e-5, 3e-5],
+    "learning_rate": [5e-6, 1e-5, 1.5e-5, 2e-5, 3e-5],
     "p_beta": [4, 8, 16],
     "p_gamma": [16, 32, 64],
     "B0_dim": [64, 128, 256],
     "B1_dim": [32, 64, 128],
     "max_recursion_depth": [3, 4, 5],
-    "halting_threshold": [0.02, 0.0285, 0.04, 0.06],
+    "halting_threshold": [0.015, 0.02, 0.025, 0.0285, 0.04, 0.06],
     "dropout_prob": [0.3, 0.5],
-    "silver_span_loss_weight": [0.05, 0.1, 0.2],
+    "silver_span_loss_weight": [0.05, 0.1, 0.15, 0.2],
     "syntax_temperature": [0.5, 1.0, 2.0],
 }
 
 PHASE1_SEARCH_SPACE_OVERRIDES = {
+    # Union neighborhood around anchor A (backup ~0.587 test MAE) and anchor B (4080_restart valid-best).
     "mosi": {
-        "learning_rate": [1e-5, 2e-5],
+        "learning_rate": [1e-5, 1.5e-5, 2e-5],
         "p_beta": [4, 8],
         "p_gamma": [16, 32],
         "B0_dim": [64, 128],
-        "B1_dim": [64, 128],
-        "max_recursion_depth": [4, 5],
-        "halting_threshold": [0.02, 0.0285, 0.04],
+        "B1_dim": [32, 64, 128],
+        "max_recursion_depth": [3, 4, 5],
+        "halting_threshold": [0.02, 0.025, 0.0285, 0.04, 0.06],
         "dropout_prob": [0.3, 0.5],
-        "silver_span_loss_weight": [0.1, 0.2],
+        "silver_span_loss_weight": [0.05, 0.1, 0.15, 0.2],
         "syntax_temperature": [0.5, 1.0],
     }
 }
 
-PRIOR_ANCHOR_CONFIGS = {
-    "mosi": {
-        "learning_rate": 2e-5,
-        "p_beta": 4,
-        "p_gamma": 16,
-        "B0_dim": 64,
-        "B1_dim": 128,
-        "max_recursion_depth": 5,
-        "halting_threshold": 0.04,
-        "dropout_prob": 0.5,
-        "silver_span_loss_weight": 0.2,
-        "syntax_temperature": 1.0,
-    }
-}
+# Non-MOSI datasets only (MOSI anchors load from mosi_dual_anchor_configs.json).
+PRIOR_ANCHOR_CONFIGS: dict = {}
 
 DEFAULT_CONFIG = {
     "learning_rate": 1e-5,
@@ -80,6 +73,8 @@ DEFAULT_CONFIG = {
     "silver_span_loss_weight": 0.1,
     "syntax_temperature": 1.0,
 }
+
+MOSI_DUAL_ANCHOR_JSON = Path(__file__).resolve().parent / "mosi_dual_anchor_configs.json"
 
 PHASE1_NAMES = {"anchor", "random", "seed_random"}
 
@@ -269,10 +264,28 @@ def get_phase1_search_space(dataset):
 
 
 def get_prior_anchor_config(dataset):
+    if dataset == "mosi":
+        anchor_a, _ = load_mosi_dual_anchors()
+        return anchor_a
     config = PRIOR_ANCHOR_CONFIGS.get(dataset)
     if config is None:
         return None
     return normalize_config(config)
+
+
+def load_mosi_dual_anchors():
+    """Return (anchor_A, anchor_B) normalized MOSI hyperparams from JSON (see scripts/mosi_dual_anchor_configs.json)."""
+    with open(MOSI_DUAL_ANCHOR_JSON, encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    hp_keys = tuple(SEARCH_SPACE.keys())
+
+    def _subset(entry):
+        return {k: entry[k] for k in hp_keys if k in entry}
+
+    anchor_a = normalize_config(_subset(data["anchor_A_backup_trial31"]))
+    anchor_b = normalize_config(_subset(data["anchor_B_4080_restart_trial33"]))
+    return anchor_a, anchor_b
 
 
 def build_train_command(dataset, config, n_epochs, selection_metric, early_stopping_patience):
@@ -548,6 +561,21 @@ def build_local_search_space(center_config, radius):
     return local_space
 
 
+def merge_local_search_spaces(local_spaces):
+    """Union per-hparam choice lists from several ``build_local_search_space`` outputs."""
+    if not local_spaces:
+        return {}
+    merged = {}
+    for name in SEARCH_SPACE:
+        seen = []
+        for space in local_spaces:
+            for value in space.get(name, []):
+                if value not in seen:
+                    seen.append(value)
+        merged[name] = seen
+    return merged
+
+
 def find_duplicate_completed_trial(study, config):
     signature = config_signature(config)
     for trial in study.trials:
@@ -738,6 +766,12 @@ def main():
         if phase1_anchor_config is not None:
             print(f"Phase 1 anchor config: {phase1_anchor_config}")
             study.enqueue_trial(phase1_anchor_config)
+            anchor_trials = 1
+            if args.dataset == "mosi":
+                _, anchor_b = load_mosi_dual_anchors()
+                print(f"Phase 1 second anchor (4080_restart best region): {anchor_b}")
+                study.enqueue_trial(anchor_b)
+                anchor_trials = 2
             study = run_phase(
                 args,
                 study_name,
@@ -746,7 +780,7 @@ def main():
                 output_dir,
                 phase_name="anchor",
                 sampler=base_sampler,
-                n_trials=1,
+                n_trials=anchor_trials,
                 search_space=phase1_search_space,
                 phase1_source=phase1_source,
                 phase1_search_space=phase1_search_space,
@@ -774,7 +808,19 @@ def main():
         raise RuntimeError("No completed phase-1 trials available for local refinement")
 
     center_config = normalize_config(phase1_best.user_attrs.get("config"))
-    local_search_space = build_local_search_space(center_config, args.local_radius)
+    if args.dataset == "mosi":
+        anchor_a, anchor_b = load_mosi_dual_anchors()
+        local_search_space = merge_local_search_spaces(
+            [
+                build_local_search_space(anchor_a, args.local_radius),
+                build_local_search_space(anchor_b, args.local_radius),
+            ]
+        )
+        print("=== MOSI local TPE: merged categorical neighborhoods (dual anchors) ===")
+        print(f"anchor_A (backup test-strong): {anchor_a}")
+        print(f"anchor_B (4080_restart valid-best): {anchor_b}")
+    else:
+        local_search_space = build_local_search_space(center_config, args.local_radius)
 
     print("=== Phase 1 Best ===")
     print(f"trial={phase1_best.number}, phase={phase1_best.user_attrs.get('phase')}")

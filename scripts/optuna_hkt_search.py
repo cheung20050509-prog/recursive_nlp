@@ -4,6 +4,10 @@
 Phase 1 uses ``RandomSampler``; phase 2 reuses the same study with
 ``TPESampler``. Each trial shells out to ``train_hkt_binary.py`` (which writes
 ``result.json`` per run); we parse that file to pull the primary metric.
+``syntax_loss_weight`` is searched when ``datasets/<dataset>_silver_spans.pkl``
+exists; otherwise Optuna restricts it to ``[0.0]`` (see README silver section).
+Use ``--syntax-loss-weight-sampling uniform`` for ``suggest_float`` in
+``[0, --syntax-loss-weight-high]`` (requires a new ``--study_prefix``).
 
 Default primary metric is ``valid_accuracy`` (model-selection protocol the
 trainer uses by default). For MUStARD the search runs on the HKT single-fold
@@ -16,9 +20,10 @@ Typical launch (total budget ~80 trials: random exploration + TPE):
         --random_trials 20 --tpe_trials 60 \
         --output_dir log/4080_restart_hkt
 
-    python scripts/optuna_hkt_search.py --dataset urfunny --gpu 0 \
-        --random_trials 15 --tpe_trials 45 \
-        --output_dir log/4080_restart_hkt
+Fleet launcher (default all on GPU 0, outputs under ``log/4080_restart/{mustard,urfunny,simsv2}/``):
+``bash scripts/start_silver_span_optuna.sh``
+starts mustard, urfunny, and simsv2 Optuna drivers in parallel. To stop one
+driver, send SIGINT to its PID (current trial finishes, then exit).
 
 Reusing or restarting studies: the same ``--output_dir``, ``--study_prefix``,
 and ``--primary_metric`` load ``optuna_study.sqlite3`` with
@@ -45,8 +50,6 @@ GRACEFUL_STOP_REQUESTED = False
 GRACEFUL_STOP_SIGNAL = None
 
 
-# Narrower than MOSI/MOSEI (no silver spans). Includes ``train_batch_size`` and
-# extra ITHP knobs exposed by ``train_hkt_binary.py`` (IB path, fusion, schedule).
 SEARCH_SPACE = {
     "learning_rate": [5e-6, 1e-5, 2e-5, 3e-5],
     "p_beta": [4, 8, 16],
@@ -64,7 +67,12 @@ SEARCH_SPACE = {
     "train_batch_size": [8, 16, 32],
     "gradient_accumulation_step": [1, 2],
     "max_grad_norm": [0.5, 1.0],
+    # Same role as MOSI ``silver_span_loss_weight``; forwarded to train_hkt_binary --syntax_loss_weight.
+    "syntax_loss_weight": [0.0, 0.05, 0.1],
 }
+
+# Mutable copy; ``main()`` may restrict ``syntax_loss_weight`` to ``[0.0]`` when the silver pickle is missing.
+ACTIVE_SEARCH_SPACE = dict(SEARCH_SPACE)
 
 METRIC_DIRECTIONS = {
     "valid_accuracy": "maximize",
@@ -174,6 +182,22 @@ def parse_args():
         choices=["auto", "albert", "deberta"],
         help="Forwarded to train_hkt_binary --backbone when not 'auto'.",
     )
+    parser.add_argument(
+        "--syntax-loss-weight-sampling",
+        choices=["categorical", "uniform"],
+        default="categorical",
+        help=(
+            "categorical: use SEARCH_SPACE discrete grid for syntax_loss_weight. "
+            "uniform: Optuna suggest_float in [0, --syntax-loss-weight-high] (requires silver pickle; "
+            "use a new --study_prefix when switching modes — incompatible with old categorical studies)."
+        ),
+    )
+    parser.add_argument(
+        "--syntax-loss-weight-high",
+        default=0.15,
+        type=float,
+        help="Upper bound for uniform syntax_loss_weight sampling (inclusive; lower bound is 0).",
+    )
     args = parser.parse_args()
 
     # Normalise dataset aliases the same way train_hkt_binary.py does.
@@ -190,6 +214,8 @@ def parse_args():
         raise SystemExit("--fold is only meaningful for dataset=mustard")
     if args.github_style and args.hkt_paper_style:
         raise SystemExit("Use either --github_style or --hkt_paper_style, not both")
+    if args.syntax_loss_weight_sampling == "uniform" and args.syntax_loss_weight_high <= 0:
+        raise SystemExit("--syntax-loss-weight-high must be > 0 when using --syntax-loss-weight-sampling uniform")
     return args
 
 
@@ -218,7 +244,7 @@ def metric_value(result, metric_name):
     return float(value)
 
 
-def build_train_command(args, config, run_name):
+def build_train_command(args, config, run_name, repo_root: Path):
     command = [
         PYTHON,
         "-u",
@@ -248,16 +274,51 @@ def build_train_command(args, config, run_name):
         command.extend(["--model", str(args.base_model)])
     if getattr(args, "backbone", "auto") != "auto":
         command.extend(["--backbone", str(args.backbone)])
+
+    silver_rel = f"datasets/{args.dataset}_silver_spans.pkl"
+    silver_path = repo_root / silver_rel
+    if silver_path.is_file():
+        command.extend(["--silver_span_cache", silver_rel])
+
     for key, value in config.items():
         command.extend([f"--{key}", str(value)])
     return command
 
 
-def suggest_config(trial):
-    return {
-        name: trial.suggest_categorical(name, choices)
-        for name, choices in SEARCH_SPACE.items()
-    }
+def _merge_frozen_categorical_distributions(study: optuna.Study, space: dict) -> dict:
+    """Align categorical ``choices`` with distributions already stored in the study (resume-safe)."""
+    frozen: dict[str, tuple] = {}
+    for t in study.trials:
+        for name, dist in (t.distributions or {}).items():
+            if name in frozen or not hasattr(dist, "choices"):
+                continue
+            frozen[name] = tuple(dist.choices)
+    if not frozen:
+        return space
+    merged = dict(space)
+    for name, choices in frozen.items():
+        if name not in merged:
+            continue
+        cur = merged[name]
+        if isinstance(cur, (list, tuple)) and tuple(cur) != choices:
+            merged[name] = list(choices)
+    return merged
+
+
+def suggest_config(trial, args):
+    space = dict(ACTIVE_SEARCH_SPACE)
+    space = _merge_frozen_categorical_distributions(trial.study, space)
+    use_uniform_syntax = (
+        args.syntax_loss_weight_sampling == "uniform"
+        and len(space.get("syntax_loss_weight", [0.0])) > 1
+    )
+    if use_uniform_syntax:
+        space.pop("syntax_loss_weight", None)
+    config = {name: trial.suggest_categorical(name, choices) for name, choices in space.items()}
+    if use_uniform_syntax:
+        hi = float(args.syntax_loss_weight_high)
+        config["syntax_loss_weight"] = trial.suggest_float("syntax_loss_weight", 0.0, hi)
+    return config
 
 
 def count_completed_trials(study, phase_name):
@@ -321,7 +382,7 @@ def write_artifacts(study, output_dir, primary_metric):
 
 
 def run_trial(trial, args, phase_name, work_dir, output_dir):
-    config = suggest_config(trial)
+    config = suggest_config(trial, args)
     run_name = f"{args.dataset}/trial_logs/{phase_name}/trial_{trial.number:04d}"
     trial_dir = output_dir / "trial_logs" / phase_name / f"trial_{trial.number:04d}"
     trial_dir.mkdir(parents=True, exist_ok=True)
@@ -336,7 +397,7 @@ def run_trial(trial, args, phase_name, work_dir, output_dir):
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
-    command = build_train_command(args, config, run_name)
+    command = build_train_command(args, config, run_name, work_dir)
 
     print(f"[{phase_name}][Trial {trial.number}] Config: {config}", flush=True)
     print(f"[{phase_name}][Trial {trial.number}] Log: {log_path}", flush=True)
@@ -418,6 +479,19 @@ def main():
     work_dir = Path(__file__).resolve().parent.parent
     os.chdir(work_dir)
 
+    global ACTIVE_SEARCH_SPACE
+    ACTIVE_SEARCH_SPACE = dict(SEARCH_SPACE)
+    silver_path = work_dir / "datasets" / f"{args.dataset}_silver_spans.pkl"
+    if not silver_path.is_file():
+        ACTIVE_SEARCH_SPACE["syntax_loss_weight"] = [0.0]
+        print(
+            "NOTICE: HKT Optuna — "
+            f"datasets/{args.dataset}_silver_spans.pkl not found; syntax_loss_weight is restricted to [0.0]. "
+            "Build cache with:\n"
+            f"  python scripts/build_hkt_silver_span_cache.py --dataset {args.dataset}",
+            flush=True,
+        )
+
     output_dir = Path(args.output_dir) / args.dataset
     output_dir.mkdir(parents=True, exist_ok=True)
     storage_path = (output_dir / "optuna_study.sqlite3").resolve()
@@ -434,6 +508,15 @@ def main():
     print(f"Selection metric: {args.selection_metric}")
     print(f"Epochs per trial: {args.n_epochs}")
     print(f"Early stopping patience: {args.early_stopping_patience}")
+    print(
+        f"syntax_loss_weight sampling: {args.syntax_loss_weight_sampling}"
+        + (
+            f" (uniform [0, {args.syntax_loss_weight_high}])"
+            if args.syntax_loss_weight_sampling == "uniform"
+            else ""
+        ),
+        flush=True,
+    )
 
     random_sampler = optuna.samplers.RandomSampler(seed=args.seed)
     study = run_phase(

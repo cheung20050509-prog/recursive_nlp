@@ -460,6 +460,12 @@ def set_up_data_loader():
         )
 
     silver_span_cache = load_silver_span_cache()
+    if args.dataset == "simsv2" and args.silver_span_loss_weight > 0.0 and silver_span_cache is None:
+        raise ValueError(
+            "SIMSv2 with --silver_span_loss_weight > 0 requires a silver span cache. "
+            "Build datasets/simsv2_silver_spans.pkl (see README) or pass --silver_span_cache, "
+            "or disable syntax supervision with --silver_span_loss_weight 0."
+        )
 
     train_data = data["train"]
     dev_data = data["dev"]
