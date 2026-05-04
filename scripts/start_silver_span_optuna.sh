@@ -111,6 +111,10 @@ URFUNNY_TPE_TRIALS="${URFUNNY_TPE_TRIALS:-45}"
 SIMSV2_RANDOM_TRIALS="${SIMSV2_RANDOM_TRIALS:-50}"
 SIMSV2_TPE_TRIALS="${SIMSV2_TPE_TRIALS:-100}"
 
+HKT_EXTRA_ARGS=()
+if [[ -n "${HKT_N_EPOCHS:-}" ]]; then HKT_EXTRA_ARGS+=(--n_epochs "$HKT_N_EPOCHS"); fi
+if [[ -n "${HKT_EARLY_STOP_PATIENCE:-}" ]]; then HKT_EXTRA_ARGS+=(--early_stopping_patience "$HKT_EARLY_STOP_PATIENCE"); fi
+
 BASE_MODEL_ARGS=()
 if [[ -n "${SIMSV2_BASE_MODEL:-}" ]]; then
   BASE_MODEL_ARGS=(--base_model "$SIMSV2_BASE_MODEL")
@@ -120,6 +124,7 @@ cat >"$OUT_DIR/README.txt" <<EOF
 Silver-span Optuna fleet — unified under FLEET_OUT=$FLEET_OUT (HKT_OUT=$HKT_OUT, SIMSV2_OUT=$SIMSV2_OUT).
 Started: $(date -Is)
 Study prefixes: HKT=$HKT_STUDY_PREFIX | simsv2=$SIMSV2_STUDY_PREFIX
+Optional HKT overrides: HKT_N_EPOCHS, HKT_EARLY_STOP_PATIENCE (passed to optuna_hkt_search when set).
 MUStARD  -> GPU $MUSTARD_GPU  | $HKT_OUT/mustard  | random=$MUSTARD_RANDOM_TRIALS  tpe=$MUSTARD_TPE_TRIALS
 UR-FUNNY -> GPU $URFUNNY_GPU | $HKT_OUT/urfunny | random=$URFUNNY_RANDOM_TRIALS tpe=$URFUNNY_TPE_TRIALS
 SIMSv2   -> GPU $SIMSV2_GPU  | $SIMSV2_OUT/simsv2 | random=$SIMSV2_RANDOM_TRIALS tpe=$SIMSV2_TPE_TRIALS
@@ -135,7 +140,8 @@ EOF
     --output_dir "$HKT_OUT" \
     --study_prefix "$HKT_STUDY_PREFIX" \
     --random_trials "$MUSTARD_RANDOM_TRIALS" \
-    --tpe_trials "$MUSTARD_TPE_TRIALS"
+    --tpe_trials "$MUSTARD_TPE_TRIALS" \
+    "${HKT_EXTRA_ARGS[@]}"
 ) >"$OUT_DIR/mustard_optuna.log" 2>&1 &
 echo $! >"$OUT_DIR/mustard_optuna.pid"
 
@@ -148,7 +154,8 @@ echo $! >"$OUT_DIR/mustard_optuna.pid"
     --output_dir "$HKT_OUT" \
     --study_prefix "$HKT_STUDY_PREFIX" \
     --random_trials "$URFUNNY_RANDOM_TRIALS" \
-    --tpe_trials "$URFUNNY_TPE_TRIALS"
+    --tpe_trials "$URFUNNY_TPE_TRIALS" \
+    "${HKT_EXTRA_ARGS[@]}"
 ) >"$OUT_DIR/urfunny_optuna.log" 2>&1 &
 echo $! >"$OUT_DIR/urfunny_optuna.pid"
 

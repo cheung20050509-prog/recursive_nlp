@@ -12,6 +12,12 @@ dimension z-score (unless ``--skip_normalize``). Model selection via
 ``--selection_metric``; ``--fold`` for MUStARD k-fold. Writes ``result.json`` per
 run.
 
+**Decision threshold:** Default is a fixed **0.5** on sigmoid probabilities (``best``
+in ``result.json``). With ``--decision_threshold_mode tune_on_valid``, a scalar
+``T`` is chosen on the **dev** split to maximize ``--threshold_tune_objective``,
+then applied to **test**; results live under ``threshold_tuning`` (dev-based
+selection can look optimistic on test vs strict 0.5 / paper protocols).
+
 GitHub-style MHD/MSD compatibility knobs (match ``My_creation@MHD_MSD_optuna``
 ``data_humor.py`` + ``train_classify.py`` processing; disabled by default):
 
@@ -219,6 +225,30 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="log/4080_restart_hkt")
     parser.add_argument("--run_name", type=str, default="",
                         help="Optional subdirectory under output_dir; defaults to <dataset>[_fold_k].")
+    parser.add_argument(
+        "--decision_threshold_mode",
+        type=str,
+        choices=["fixed", "tune_on_valid"],
+        default="fixed",
+        help=(
+            "fixed: classify with probability >= 0.5 (HKT-style). "
+            "tune_on_valid: after training, pick T on dev to maximize --threshold_tune_objective, "
+            "then report valid/test metrics at T under result.json 'threshold_tuning'."
+        ),
+    )
+    parser.add_argument(
+        "--threshold_tune_objective",
+        type=str,
+        choices=["accuracy", "f1"],
+        default="accuracy",
+        help="When decision_threshold_mode=tune_on_valid: which dev metric to maximize when scanning T.",
+    )
+    parser.add_argument(
+        "--threshold_grid_size",
+        type=int,
+        default=91,
+        help="Number of equally-spaced thresholds in [0.05, 0.95]; 0.5 is always included.",
+    )
     args = parser.parse_args()
 
     if args.github_style and args.hkt_paper_style:
@@ -242,6 +272,8 @@ def parse_args():
         raise ValueError("max_recursion_depth must be at least 1")
     if args.early_stopping_patience < 0:
         raise ValueError("early_stopping_patience must be non-negative")
+    if args.threshold_grid_size < 3:
+        raise ValueError("threshold_grid_size must be at least 3")
     if args.ib_loss_weight < 0:
         args.ib_loss_weight = 2.0 / (args.p_beta + args.p_gamma)
     if args.hcf_dim < 1:
@@ -713,8 +745,11 @@ def prep_for_training(num_train_optimization_steps: int):
     return model, optimizer, scheduler
 
 
-def compute_binary_metrics(probabilities, labels):
-    predictions = probabilities.round()
+def compute_binary_metrics(probabilities, labels, threshold=0.5):
+    """Binary predictions via ``probs >= threshold`` (threshold 0.5 = standard logistic cut)."""
+    probs = np.asarray(probabilities, dtype=np.float64).reshape(-1)
+    labels = np.asarray(labels).reshape(-1).astype(np.int64)
+    predictions = (probs >= float(threshold)).astype(np.int64)
     f1_binary = float(f1_score(labels, predictions, average="binary", zero_division=0))
     f1_weighted = float(f1_score(labels, predictions, average="weighted", zero_division=0))
     return {
@@ -726,7 +761,48 @@ def compute_binary_metrics(probabilities, labels):
     }
 
 
-def run_epoch(model, dataloader, loss_fct, optimizer=None, scheduler=None, desc="Eval"):
+def tune_threshold_on_valid(dev_probs, dev_labels, objective: str, grid_size: int) -> tuple[float, dict]:
+    """Pick T in [0.05, 0.95] maximizing objective on dev; ties broken by smaller T."""
+    probs = np.asarray(dev_probs, dtype=np.float64).reshape(-1)
+    labels = np.asarray(dev_labels).reshape(-1).astype(np.int64)
+    if probs.size == 0:
+        print("THRESHOLD_TUNE: empty dev set; falling back to T=0.5", flush=True)
+        return 0.5, compute_binary_metrics(probs, labels, threshold=0.5)
+
+    if len(np.unique(probs)) <= 1:
+        print("THRESHOLD_TUNE: constant dev probabilities; falling back to T=0.5", flush=True)
+        return 0.5, compute_binary_metrics(probs, labels, threshold=0.5)
+
+    lo, hi = 0.05, 0.95
+    grid = np.unique(np.concatenate([np.linspace(lo, hi, max(3, int(grid_size))), [0.5]]))
+    grid.sort()
+
+    metric_key = "accuracy" if objective == "accuracy" else "f1"
+    best_t = 0.5
+    best_score = float("-inf")
+    for t in grid:
+        m = compute_binary_metrics(probs, labels, threshold=float(t))
+        score = float(m[metric_key])
+        if score > best_score + 1e-15:
+            best_score = score
+            best_t = float(t)
+        elif abs(score - best_score) <= 1e-15 and float(t) < best_t:
+            best_t = float(t)
+
+    tuned = compute_binary_metrics(probs, labels, threshold=best_t)
+    return best_t, tuned
+
+
+def merge_tuned_classification_head(base_metrics: dict, tuned_cls: dict) -> dict:
+    """Keep loss / recursion stats from ``base_metrics``; overwrite accuracy and F1 fields."""
+    out = dict(base_metrics)
+    for key in ("accuracy", "f1", "f1_binary", "f1_weighted", "f1_hkt_paper"):
+        if key in tuned_cls:
+            out[key] = tuned_cls[key]
+    return out
+
+
+def run_epoch(model, dataloader, loss_fct, optimizer=None, scheduler=None, desc="Eval", return_prob_arrays=False):
     training = optimizer is not None
     if training:
         model.train()
@@ -788,10 +864,14 @@ def run_epoch(model, dataloader, loss_fct, optimizer=None, scheduler=None, desc=
         optimizer.zero_grad()
 
     average_loss = total_loss / max(len(dataloader), 1)
-    metrics = compute_binary_metrics(np.array(probabilities), np.array(labels))
+    probs_arr = np.asarray(probabilities, dtype=np.float64)
+    labels_arr = np.asarray(labels).astype(np.int64)
+    metrics = compute_binary_metrics(probs_arr, labels_arr)
     metrics["avg_recursion_steps"] = recursion_steps_total / max(sample_count, 1)
     metrics["max_depth_hit_rate"] = max_depth_hits / max(sample_count, 1)
     metrics["loss"] = average_loss
+    if return_prob_arrays:
+        return metrics, probs_arr.copy(), labels_arr.copy()
     return metrics
 
 
@@ -839,13 +919,23 @@ def main():
 
     best_result = None
     best_state_dict = None
+    best_dev_probs = best_dev_labels = best_test_probs = best_test_labels = None
+    tune_mode = args.decision_threshold_mode == "tune_on_valid"
     stale_epochs = 0
     started_at = time.time()
 
     for epoch_index in range(args.n_epochs):
         train_metrics = run_epoch(model, train_loader, loss_fct, optimizer=optimizer, scheduler=scheduler, desc=f"Train[{epoch_index}]")
-        valid_metrics = run_epoch(model, dev_loader, loss_fct, desc=f"Dev[{epoch_index}]")
-        test_metrics = run_epoch(model, test_loader, loss_fct, desc=f"Test[{epoch_index}]")
+        if tune_mode:
+            valid_metrics, dev_p, dev_l = run_epoch(
+                model, dev_loader, loss_fct, desc=f"Dev[{epoch_index}]", return_prob_arrays=True
+            )
+            test_metrics, test_p, test_l = run_epoch(
+                model, test_loader, loss_fct, desc=f"Test[{epoch_index}]", return_prob_arrays=True
+            )
+        else:
+            valid_metrics = run_epoch(model, dev_loader, loss_fct, desc=f"Dev[{epoch_index}]")
+            test_metrics = run_epoch(model, test_loader, loss_fct, desc=f"Test[{epoch_index}]")
 
         print(
             "epoch:{} train_loss:{:.6f} valid_loss:{:.6f} valid_acc:{:.4f} valid_f1:{:.4f} test_acc:{:.4f} test_f1:{:.4f} avg_steps:{:.2f}".format(
@@ -868,6 +958,9 @@ def main():
                 "valid": valid_metrics,
                 "test": test_metrics,
             }
+            if tune_mode:
+                best_dev_probs, best_dev_labels = dev_p, dev_l
+                best_test_probs, best_test_labels = test_p, test_l
             if args.save_weight:
                 best_state_dict = copy.deepcopy(model.state_dict())
             stale_epochs = 0
@@ -903,6 +996,38 @@ def main():
         flush=True,
     )
 
+    threshold_tuning = None
+    if tune_mode:
+        if best_dev_probs is None or best_test_probs is None:
+            raise RuntimeError("tune_on_valid enabled but dev/test probability caches are missing")
+        t_star, _dev_tuned_cls = tune_threshold_on_valid(
+            best_dev_probs,
+            best_dev_labels,
+            args.threshold_tune_objective,
+            args.threshold_grid_size,
+        )
+        dev_tuned_cls = compute_binary_metrics(best_dev_probs, best_dev_labels, threshold=t_star)
+        test_tuned_cls = compute_binary_metrics(best_test_probs, best_test_labels, threshold=t_star)
+        threshold_tuning = {
+            "mode": "tune_on_valid",
+            "objective": args.threshold_tune_objective,
+            "t_star": float(t_star),
+            "grid_size": int(args.threshold_grid_size),
+            "valid": merge_tuned_classification_head(best_result["valid"], dev_tuned_cls),
+            "test": merge_tuned_classification_head(best_result["test"], test_tuned_cls),
+        }
+        print(
+            "THRESHOLD_TUNING: T_star={:.4f} objective={} valid_acc_t={:.4f} valid_f1_t={:.4f} test_acc_t={:.4f} test_f1_t={:.4f}".format(
+                t_star,
+                args.threshold_tune_objective,
+                threshold_tuning["valid"]["accuracy"],
+                threshold_tuning["valid"]["f1"],
+                threshold_tuning["test"]["accuracy"],
+                threshold_tuning["test"]["f1"],
+            ),
+            flush=True,
+        )
+
     cli_snapshot = {
         key: value
         for key, value in vars(args).items()
@@ -915,14 +1040,26 @@ def main():
         "backbone": args.resolved_backbone,
         "hkt_paper_style": bool(getattr(args, "hkt_paper_style", False)),
         "metric_definitions": {
-            "f1_hkt_paper": "sklearn f1 average=binary, same 0.5-threshold labels as HKT test README F-score",
-            "accuracy": "0.5 threshold on sigmoid logits",
+            "best_block": (
+                "Epoch chosen by --selection_metric on dev using a fixed 0.5 decision threshold "
+                "(probability >= 0.5); train/valid/test metrics at 0.5."
+            ),
+            "f1_hkt_paper": "sklearn f1 average=binary at the stated decision threshold.",
+            "accuracy": "Fraction correct at the stated decision threshold (0.5 for 'best').",
+            "threshold_tuning_block": (
+                "When key 'threshold_tuning' is present: T_star chosen on dev to maximize "
+                "--threshold_tune_objective over a grid in [0.05, 0.95]; valid/test reuse loss and "
+                "recursion fields from 'best' but replace accuracy/F1 with metrics at T_star. "
+                "Dev-based threshold selection can look optimistic on test vs strict 0.5 / paper protocols."
+            ),
         },
         "elapsed_seconds": elapsed,
         "data": meta,
         "best": best_result,
         "args": cli_snapshot,
     }
+    if threshold_tuning is not None:
+        result_payload["threshold_tuning"] = threshold_tuning
     result_path = os.path.join(run_dir, "result.json")
     with open(result_path, "w", encoding="utf-8") as handle:
         json.dump(result_payload, handle, indent=2, ensure_ascii=False)

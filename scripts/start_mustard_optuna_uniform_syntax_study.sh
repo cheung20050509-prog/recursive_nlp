@@ -3,7 +3,7 @@
 # Optional small-weight categorical study: use start_mustard_optuna_resume_tpe.sh instead.
 #
 # Env: MUSTARD_GPU, HKT_OUT, HKT_STUDY_PREFIX, MUSTARD_RANDOM_TRIALS, MUSTARD_TPE_TRIALS,
-#      SYNTAX_UNIFORM_HIGH, PY
+#      SYNTAX_UNIFORM_HIGH, HKT_N_EPOCHS, HKT_EARLY_STOP_PATIENCE, PY
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,6 +17,10 @@ MUSTARD_RANDOM_TRIALS="${MUSTARD_RANDOM_TRIALS:-20}"
 MUSTARD_TPE_TRIALS="${MUSTARD_TPE_TRIALS:-60}"
 SYNTAX_UNIFORM_HIGH="${SYNTAX_UNIFORM_HIGH:-0.12}"
 
+HKT_EXTRA_ARGS=()
+if [[ -n "${HKT_N_EPOCHS:-}" ]]; then HKT_EXTRA_ARGS+=(--n_epochs "$HKT_N_EPOCHS"); fi
+if [[ -n "${HKT_EARLY_STOP_PATIENCE:-}" ]]; then HKT_EXTRA_ARGS+=(--early_stopping_patience "$HKT_EARLY_STOP_PATIENCE"); fi
+
 mkdir -p "$HKT_OUT"
 export CUDA_VISIBLE_DEVICES="$MUSTARD_GPU"
 exec "$PY" -u scripts/optuna_hkt_search.py \
@@ -27,4 +31,5 @@ exec "$PY" -u scripts/optuna_hkt_search.py \
   --random_trials "$MUSTARD_RANDOM_TRIALS" \
   --tpe_trials "$MUSTARD_TPE_TRIALS" \
   --syntax-loss-weight-sampling uniform \
-  --syntax-loss-weight-high "$SYNTAX_UNIFORM_HIGH"
+  --syntax-loss-weight-high "$SYNTAX_UNIFORM_HIGH" \
+  "${HKT_EXTRA_ARGS[@]}"

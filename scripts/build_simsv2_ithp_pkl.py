@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+mnnnnnnnnnnn,.......#!/usr/bin/env python3
 """Convert MMSA/KuDA-style CH-SIMSv2 pickle to ITHP train.py list format."""
 
 from __future__ import annotations

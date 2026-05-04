@@ -4,7 +4,10 @@
 Phase 1 uses ``RandomSampler``; phase 2 reuses the same study with
 ``TPESampler``. Each trial shells out to ``train_hkt_binary.py`` (which writes
 ``result.json`` per run); we parse that file to pull the primary metric.
-``syntax_loss_weight`` is searched when ``datasets/<dataset>_silver_spans.pkl``
+Optional **dev-tuned decision threshold** (``--decision-threshold-mode tune_on_valid``
+and ``--primary_metric valid_*_threshold_tuned``) forwards extra flags to the trainer;
+see ``train_hkt_binary.py`` docstring for ``threshold_tuning`` in ``result.json``.
+The ``syntax_loss_weight`` hyperparameter is searched when ``datasets/<dataset>_silver_spans.pkl``
 exists; otherwise Optuna restricts it to ``[0.0]`` (see README silver section).
 Use ``--syntax-loss-weight-sampling uniform`` for ``suggest_float`` in
 ``[0, --syntax-loss-weight-high]`` (requires a new ``--study_prefix``).
@@ -13,6 +16,13 @@ Default primary metric is ``valid_accuracy`` (model-selection protocol the
 trainer uses by default). For MUStARD the search runs on the HKT single-fold
 pickle (539/68/68); set ``--fold k`` to pin to a specific speaker-independent
 fold instead. UR-FUNNY always uses its official fold.
+
+**Trial length defaults (``default_n_epochs`` / ``default_early_stopping``):**
+UR-FUNNY used to run only 5 epochs (underfitting); it now defaults to **10**
+epochs with patience **2**. MUStARD used 15 epochs with **no** early stopping
+(patience 0), which tends to overfit valid; it now defaults to patience **3**
+with the same 15-epoch cap. Override with ``--n_epochs`` /
+``--early_stopping_patience`` when needed.
 
 Typical launch (total budget ~80 trials: random exploration + TPE):
 
@@ -76,7 +86,9 @@ ACTIVE_SEARCH_SPACE = dict(SEARCH_SPACE)
 
 METRIC_DIRECTIONS = {
     "valid_accuracy": "maximize",
+    "valid_accuracy_threshold_tuned": "maximize",
     "valid_f1": "maximize",
+    "valid_f1_threshold_tuned": "maximize",
     "valid_loss": "minimize",
     "test_accuracy": "maximize",
     "test_f1": "maximize",
@@ -119,11 +131,13 @@ def maybe_stop_study_after_trial(study, trial):
 
 
 def default_n_epochs(dataset):
-    return 5 if dataset == "urfunny" else 15
+    """UR-FUNNY: was 5 (often underfit); 10 gives more room before early stop."""
+    return 10 if dataset == "urfunny" else 15
 
 
 def default_early_stopping(dataset):
-    return 2 if dataset == "urfunny" else 0
+    """MUStARD: non-zero patience reduces valid overfitting; UR-FUNNY keeps 2."""
+    return 2 if dataset == "urfunny" else 3
 
 
 def parse_args():
@@ -198,6 +212,27 @@ def parse_args():
         type=float,
         help="Upper bound for uniform syntax_loss_weight sampling (inclusive; lower bound is 0).",
     )
+    parser.add_argument(
+        "--decision-threshold-mode",
+        dest="decision_threshold_mode",
+        choices=["fixed", "tune_on_valid"],
+        default="fixed",
+        help="Forwarded to train_hkt_binary --decision_threshold_mode.",
+    )
+    parser.add_argument(
+        "--threshold-tune-objective",
+        dest="threshold_tune_objective",
+        choices=["accuracy", "f1"],
+        default="accuracy",
+        help="Forwarded to train_hkt_binary when using tune_on_valid.",
+    )
+    parser.add_argument(
+        "--threshold-grid-size",
+        dest="threshold_grid_size",
+        type=int,
+        default=91,
+        help="Forwarded to train_hkt_binary --threshold_grid_size.",
+    )
     args = parser.parse_args()
 
     # Normalise dataset aliases the same way train_hkt_binary.py does.
@@ -216,6 +251,16 @@ def parse_args():
         raise SystemExit("Use either --github_style or --hkt_paper_style, not both")
     if args.syntax_loss_weight_sampling == "uniform" and args.syntax_loss_weight_high <= 0:
         raise SystemExit("--syntax-loss-weight-high must be > 0 when using --syntax-loss-weight-sampling uniform")
+    if args.threshold_grid_size < 3:
+        raise SystemExit("--threshold-grid-size must be >= 3")
+    if args.primary_metric in ("valid_accuracy_threshold_tuned", "valid_f1_threshold_tuned"):
+        if args.decision_threshold_mode == "fixed":
+            args.decision_threshold_mode = "tune_on_valid"
+            print(
+                "NOTE: primary_metric requires dev threshold tuning; "
+                "setting --decision-threshold-mode tune_on_valid",
+                flush=True,
+            )
     return args
 
 
@@ -229,6 +274,14 @@ def parse_result_json(result_path):
 def metric_value(result, metric_name):
     if result is None:
         return None
+    if metric_name in ("valid_accuracy_threshold_tuned", "valid_f1_threshold_tuned"):
+        tt = result.get("threshold_tuning") or {}
+        valid = tt.get("valid") or {}
+        metric_key = "accuracy" if metric_name == "valid_accuracy_threshold_tuned" else "f1"
+        value = valid.get(metric_key)
+        if value is None:
+            return None
+        return float(value)
     best = result.get("best") or {}
     split_name, metric_key = {
         "valid_accuracy": ("valid", "accuracy"),
@@ -279,6 +332,11 @@ def build_train_command(args, config, run_name, repo_root: Path):
     silver_path = repo_root / silver_rel
     if silver_path.is_file():
         command.extend(["--silver_span_cache", silver_rel])
+
+    if getattr(args, "decision_threshold_mode", "fixed") != "fixed":
+        command.extend(["--decision_threshold_mode", args.decision_threshold_mode])
+        command.extend(["--threshold_tune_objective", args.threshold_tune_objective])
+        command.extend(["--threshold_grid_size", str(args.threshold_grid_size)])
 
     for key, value in config.items():
         command.extend([f"--{key}", str(value)])
@@ -431,10 +489,18 @@ def run_trial(trial, args, phase_name, work_dir, output_dir):
     best = result.get("best") or {}
     valid = best.get("valid") or {}
     test = best.get("test") or {}
+    tt = result.get("threshold_tuning") or {}
+    tt_test = tt.get("test") or {}
+    extra = ""
+    if tt_test:
+        extra = (
+            f", tuned_test_acc={tt_test.get('accuracy')}, tuned_test_f1={tt_test.get('f1')}"
+        )
     print(
         f"[{phase_name}][Trial {trial.number}] DONE in {elapsed:.0f}s — "
         f"{args.primary_metric}={primary:.4f}, "
-        f"valid_acc={valid.get('accuracy')}, test_acc={test.get('accuracy')}, test_f1={test.get('f1')}",
+        f"valid_acc={valid.get('accuracy')}, test_acc={test.get('accuracy')}, test_f1={test.get('f1')}"
+        f"{extra}",
         flush=True,
     )
     return primary
@@ -508,6 +574,18 @@ def main():
     print(f"Selection metric: {args.selection_metric}")
     print(f"Epochs per trial: {args.n_epochs}")
     print(f"Early stopping patience: {args.early_stopping_patience}")
+    if args.dataset == "mustard":
+        print(
+            "NOTE: MUStARD default early_stopping_patience>0 to curb valid overfit "
+            "(pass --early_stopping_patience 0 to reproduce old behaviour).",
+            flush=True,
+        )
+    elif args.dataset == "urfunny":
+        print(
+            "NOTE: UR-FUNNY default n_epochs=10 (was 5) to reduce underfit "
+            "(pass --n_epochs 5 to reproduce old behaviour).",
+            flush=True,
+        )
     print(
         f"syntax_loss_weight sampling: {args.syntax_loss_weight_sampling}"
         + (

@@ -8,7 +8,7 @@ Upstream ITHP reference: [joshuaxiao98/ITHP](https://github.com/joshuaxiao98/ITH
 
 - **CMU-MOSI / CMU-MOSEI**: **RITHM** sentiment training (`train.py`), silver-span syntax losses where applicable, KuDA-style test metrics.
 - **CH-SIMS v2 (`simsv2`)**: MMSA-style pickled features, `bert-base-chinese` (or local weights via `--model`), normalization helpers in `simsv2_data.py`, metrics in `simsv2_metrics.py`.
-- **MUStARD / UR-FUNNY**: HKT-paper-style binary classification (`train_hkt_binary.py`) and Optuna driver `scripts/optuna_hkt_search.py` (ALBERT / pickle splits). Optional **benepar silver constituency spans** on the **target utterance** (see silver coverage matrix below).
+- **MUStARD / UR-FUNNY**: HKT-paper-style binary classification (`train_hkt_binary.py`) and Optuna driver `scripts/optuna_hkt_search.py` (ALBERT / pickle splits). Optional **dev-tuned decision threshold** (`--decision_threshold_mode tune_on_valid` on the trainer, or Optuna `--decision-threshold-mode` / `--primary_metric valid_accuracy_threshold_tuned`) writes `threshold_tuning` in `result.json` (see trainer docstring). Optional **benepar silver constituency spans** on the **target utterance** (see silver coverage matrix below).
 - **Hyperparameter search**: two-phase Random + TPE Optuna studies (`scripts/optuna_search.py` for `mosi` / `mosei` / `simsv2`; SQLite storage, resumable).
 - **Paper draft assets**: `recursive_ITHP_manuscript/` (LaTeX), `baseline_table.tex` (baseline grids; build PDFs locally, not committed).
 
