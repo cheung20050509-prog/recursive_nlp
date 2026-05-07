@@ -4,6 +4,7 @@ import pickle
 import re
 import sys
 import zipfile
+from typing import List, Optional, Union
 
 import numpy as np
 from sklearn.model_selection import StratifiedShuffleSplit, StratifiedGroupKFold
@@ -176,16 +177,47 @@ def split_feature_store_record(record, context_word_count, target_word_count):
     }
 
 
-def build_hkt_example(sample_id, label, context_sentences, target_text, context_word_count, target_word_count, feature_store_record):
+def build_hkt_example(
+    sample_id,
+    label,
+    context_sentences,
+    target_text,
+    context_word_count,
+    target_word_count,
+    feature_store_record,
+    target_p_words: Optional[Union[str, List[str]]] = None,
+):
+    """Build one HKT 4-tuple example.
+
+    ``target_text`` is kept for call-site readability (e.g. punchline string from metadata).
+
+    ``target_p_words`` is written as the first element of the punchline tuple ``p_words``.
+    When ``None`` (default), ``target_text`` is used (MUStARD / legacy pickles: ``str``).
+    UR-FUNNY rebuilt from the official SDK should pass a ``list`` of words aligned with
+    ``punchline_features`` (same length as ``target_word_count``).
+    """
     split_modalities = split_feature_store_record(
         feature_store_record,
         context_word_count=context_word_count,
         target_word_count=target_word_count,
     )
 
+    p_field = target_text if target_p_words is None else target_p_words
+    if isinstance(p_field, list):
+        if len(p_field) != target_word_count:
+            raise ValueError(
+                f"target_p_words length {len(p_field)} != target_word_count {target_word_count} "
+                f"(sample_id={sample_id})"
+            )
+    if split_modalities["target_visual"].shape[0] != target_word_count:
+        raise ValueError(
+            f"target_visual length {split_modalities['target_visual'].shape[0]} != target_word_count "
+            f"(sample_id={sample_id})"
+        )
+
     return (
         (
-            target_text,
+            p_field,
             split_modalities["target_visual"],
             split_modalities["target_acoustic"],
             split_modalities["target_hcf"],
@@ -449,7 +481,7 @@ def rebuild_urfunny_hkt_dataset(repo_root=REPO_ROOT, archive_path=DEFAULT_URFUNN
             context_sentences = record.get("context_sentences") or []
             target_text = record.get("punchline_sentence", "")
             context_words = flatten_sentence_word_lists(record.get("context_features") or [])
-            target_words = list(record.get("punchline_features") or [])
+            target_words = [str(w) for w in (record.get("punchline_features") or [])]
 
             if not target_words:
                 target_words = heuristic_word_tokenize(target_text)
@@ -469,6 +501,7 @@ def rebuild_urfunny_hkt_dataset(repo_root=REPO_ROOT, archive_path=DEFAULT_URFUNN
                     context_word_count=len(context_words),
                     target_word_count=len(target_words),
                     feature_store_record=feature_store[feature_key],
+                    target_p_words=target_words,
                 )
             )
 

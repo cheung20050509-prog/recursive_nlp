@@ -2,15 +2,17 @@
 
 - **Text backbone:** ``--backbone {auto,albert,deberta}``; ``--model`` may point
   to ``albert-base-v2`` (Recursive **ITHP** + ALBERT) or DeBERTa (default path).
-- **HKT paper data/metrics (matalvepu):** ``--hkt_paper_style`` = 60+36 feature
-  subset, train z-score, HCF on, binary F1; mutually exclusive with ``--github_style``.
+- **HKT public scripts (matalvepu):** default = 60+36 subset, **no** train z-score
+  (raw features after column subset, like ``main.py`` / ``test_pretrained_models.py``),
+  HCF on, binary F1. ``--hkt_paper_style`` locks that preset; mutually exclusive with
+  ``--github_style``.
 - **F1:** ``--primary_f1 {binary,weighted}``; ``f1_hkt_paper`` in JSON mirrors
   sklearn binary F1 (comparable to README Accuracy / F-score columns).
 
-HCF (4-dim Humor-Centric Features) flows through the multimodal encoder. Per
-dimension z-score (unless ``--skip_normalize``). Model selection via
-``--selection_metric``; ``--fold`` for MUStARD k-fold. Writes ``result.json`` per
-run.
+HCF (4-dim Humor-Centric Features) flows through the multimodal encoder. Optional
+train-fitted z-score via ``--apply_train_zscore`` (legacy ITHP; off by default).
+Model selection via ``--selection_metric``; ``--fold`` for MUStARD k-fold.
+Writes ``result.json`` per run.
 
 **Decision threshold:** Default is a fixed **0.5** on sigmoid probabilities (``best``
 in ``result.json``). With ``--decision_threshold_mode tune_on_valid``, a scalar
@@ -24,10 +26,10 @@ GitHub-style MHD/MSD compatibility knobs (match ``My_creation@MHD_MSD_optuna``
 - ``--feature_dim_mode full``  keep every HKT feature column (acoustic=81,
   visual=91) instead of the default ``subset`` (60/36) matching that repo's
   ``global_configs``.
-- ``--skip_normalize``  bypass z-score; pass raw per-word features through.
+- ``--apply_train_zscore``  enable train-fitted z-score (not in public HKT loaders).
 - ``--primary_f1 weighted``  report ``f1`` as weighted-F1 (also used for
   selection when ``--selection_metric f1``).
-- ``--github_style``  single switch that implies all three plus
+- ``--github_style``  single switch: full dims, no z-score, weighted F1, and
   ``--disable_hcf`` to mirror ``data_humor.py`` exactly.
 
 Examples:
@@ -101,7 +103,7 @@ _SILVER_SPAN_SYNTAX_DEFAULT = 0.1
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="/root/autodl-tmp/recursive_nlp/deberta-v3-base")
+    parser.add_argument("--model", type=str, default="/root/autodl-tmp/recursive_nlp/albert-base-v2")
     parser.add_argument("--dataset", type=str, choices=["mustard", "urfunny", "sarcasm", "humor"], default="mustard")
     parser.add_argument("--dataset_cache", type=str, default="")
     parser.add_argument("--fold", type=int, default=-1,
@@ -180,9 +182,18 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--apply_train_zscore",
+        action="store_true",
+        help=(
+            "Fit z-score on train and apply to dev/test (legacy ITHP). "
+            "Default is off to match matalvepu/HKT public loaders (raw features after column subset)."
+        ),
+    )
+    parser.add_argument(
         "--skip_normalize",
         action="store_true",
-        help="Skip train-fit z-score on visual/acoustic/HCF (matches GitHub data_humor.py).",
+        dest="deprecated_skip_normalize",
+        help="Deprecated no-op: defaults already skip z-score (same as public HKT scripts).",
     )
     parser.add_argument(
         "--primary_f1",
@@ -199,23 +210,22 @@ def parse_args():
         "--github_style",
         action="store_true",
         help=(
-            "Convenience preset: enables --feature_dim_mode full, --skip_normalize, "
-            "--primary_f1 weighted, and --disable_hcf to mirror the GitHub "
-            "MHD_MSD_optuna data processing 1:1."
+            "Convenience preset: --feature_dim_mode full, no z-score, --primary_f1 weighted, "
+            "and --disable_hcf to mirror the GitHub MHD_MSD_optuna data processing 1:1."
         ),
     )
     parser.add_argument(
         "--hkt_paper_style",
         action="store_true",
         help=(
-            "Align with matalvepu/HKT data protocol: 60+36 feature subset, train-fitted z-score, "
-            "HCF on, binary F1 as primary. Mutually exclusive with --github_style."
+            "Align with matalvepu/HKT public data path: 60+36 subset, raw features (no train z-score), "
+            "HCF on, binary F1. Mutually exclusive with --github_style."
         ),
     )
     parser.add_argument(
         "--backbone",
         type=str,
-        default="auto",
+        default="albert",
         choices=["auto", "deberta", "albert"],
         help=(
             "Text encoder: 'albert' uses ITHP_AlbertForBinaryClassification + ALBERT; "
@@ -258,12 +268,15 @@ def parse_args():
         args.skip_normalize = True
         args.primary_f1 = "weighted"
         args.disable_hcf = True
-    if args.hkt_paper_style:
-        # matalvepu HKT: subset features, HCF, z-score (train only); binary F1 like README F-score
+    elif args.hkt_paper_style:
         args.feature_dim_mode = "subset"
-        args.skip_normalize = False
+        args.skip_normalize = True
         args.primary_f1 = "binary"
         args.disable_hcf = False
+    else:
+        if args.apply_train_zscore and args.deprecated_skip_normalize:
+            raise ValueError("Use only one of --apply_train_zscore and --skip_normalize")
+        args.skip_normalize = not args.apply_train_zscore
 
     args.dataset = normalize_dataset_name(args.dataset)
     if args.max_seq_length <= 0:
@@ -1032,6 +1045,7 @@ def main():
         key: value
         for key, value in vars(args).items()
         if isinstance(value, (int, float, str, bool, list))
+        and key != "deprecated_skip_normalize"
     }
     result_payload = {
         "dataset": args.dataset,

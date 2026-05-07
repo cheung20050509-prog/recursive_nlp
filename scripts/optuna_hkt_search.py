@@ -7,10 +7,11 @@ Phase 1 uses ``RandomSampler``; phase 2 reuses the same study with
 Optional **dev-tuned decision threshold** (``--decision-threshold-mode tune_on_valid``
 and ``--primary_metric valid_*_threshold_tuned``) forwards extra flags to the trainer;
 see ``train_hkt_binary.py`` docstring for ``threshold_tuning`` in ``result.json``.
-The ``syntax_loss_weight`` hyperparameter is searched when ``datasets/<dataset>_silver_spans.pkl``
-exists; otherwise Optuna restricts it to ``[0.0]`` (see README silver section).
-Use ``--syntax-loss-weight-sampling uniform`` for ``suggest_float`` in
-``[0, --syntax-loss-weight-high]`` (requires a new ``--study_prefix``).
+The ``syntax_loss_weight`` hyperparameter is sampled uniformly via ``suggest_float``
+in ``[0, --syntax-loss-weight-high]`` when ``datasets/<dataset>_silver_spans.pkl``
+exists; otherwise it is pinned to ``0.0``.
+
+``--require-syntax-span-loss`` raises the lower bound to ``0.05``.
 
 Default primary metric is ``valid_accuracy`` (model-selection protocol the
 trainer uses by default). For MUStARD the search runs on the HKT single-fold
@@ -77,8 +78,6 @@ SEARCH_SPACE = {
     "train_batch_size": [8, 16, 32],
     "gradient_accumulation_step": [1, 2],
     "max_grad_norm": [0.5, 1.0],
-    # Same role as MOSI ``silver_span_loss_weight``; forwarded to train_hkt_binary --syntax_loss_weight.
-    "syntax_loss_weight": [0.0, 0.05, 0.1],
 }
 
 # Mutable copy; ``main()`` may restrict ``syntax_loss_weight`` to ``[0.0]`` when the silver pickle is missing.
@@ -95,6 +94,9 @@ METRIC_DIRECTIONS = {
 }
 
 PYTHON = "/root/autodl-tmp/anaconda3/envs/ITHP5090/bin/python"
+
+# Lower bound for ``syntax_loss_weight`` when ``--require-syntax-span-loss`` + uniform sampling.
+_SYNTAX_LOSS_UNIFORM_LO = 0.05
 
 
 def _signal_name(signum):
@@ -181,7 +183,7 @@ def parse_args():
     parser.add_argument(
         "--hkt_paper_style",
         action="store_true",
-        help="Forward --hkt_paper_style to every trial (60+36, z-score, HCF, binary F1). Incompatible with --github_style.",
+        help="Forward --hkt_paper_style to every trial (60+36, raw features, HCF, binary F1). Incompatible with --github_style.",
     )
     parser.add_argument(
         "--base_model",
@@ -197,20 +199,19 @@ def parse_args():
         help="Forwarded to train_hkt_binary --backbone when not 'auto'.",
     )
     parser.add_argument(
-        "--syntax-loss-weight-sampling",
-        choices=["categorical", "uniform"],
-        default="categorical",
-        help=(
-            "categorical: use SEARCH_SPACE discrete grid for syntax_loss_weight. "
-            "uniform: Optuna suggest_float in [0, --syntax-loss-weight-high] (requires silver pickle; "
-            "use a new --study_prefix when switching modes — incompatible with old categorical studies)."
-        ),
-    )
-    parser.add_argument(
         "--syntax-loss-weight-high",
         default=0.15,
         type=float,
-        help="Upper bound for uniform syntax_loss_weight sampling (inclusive; lower bound is 0).",
+        help="Upper bound for uniform syntax_loss_weight sampling in [0, high] (or [0.05, high] with --require-syntax-span-loss).",
+    )
+    parser.add_argument(
+        "--require-syntax-span-loss",
+        dest="require_syntax_span_loss",
+        action="store_true",
+        help=(
+            "Require non-zero silver span loss: lower bound raised to 0.05 for syntax_loss_weight. "
+            "Requires datasets/<dataset>_silver_spans.pkl."
+        ),
     )
     parser.add_argument(
         "--decision-threshold-mode",
@@ -249,8 +250,15 @@ def parse_args():
         raise SystemExit("--fold is only meaningful for dataset=mustard")
     if args.github_style and args.hkt_paper_style:
         raise SystemExit("Use either --github_style or --hkt_paper_style, not both")
-    if args.syntax_loss_weight_sampling == "uniform" and args.syntax_loss_weight_high <= 0:
-        raise SystemExit("--syntax-loss-weight-high must be > 0 when using --syntax-loss-weight-sampling uniform")
+    if args.syntax_loss_weight_high <= 0:
+        raise SystemExit("--syntax-loss-weight-high must be > 0")
+    if (
+        args.require_syntax_span_loss
+        and args.syntax_loss_weight_high <= _SYNTAX_LOSS_UNIFORM_LO
+    ):
+        raise SystemExit(
+            f"--syntax-loss-weight-high must be > {_SYNTAX_LOSS_UNIFORM_LO} when using --require-syntax-span-loss"
+        )
     if args.threshold_grid_size < 3:
         raise SystemExit("--threshold-grid-size must be >= 3")
     if args.primary_metric in ("valid_accuracy_threshold_tuned", "valid_f1_threshold_tuned"):
@@ -366,16 +374,10 @@ def _merge_frozen_categorical_distributions(study: optuna.Study, space: dict) ->
 def suggest_config(trial, args):
     space = dict(ACTIVE_SEARCH_SPACE)
     space = _merge_frozen_categorical_distributions(trial.study, space)
-    use_uniform_syntax = (
-        args.syntax_loss_weight_sampling == "uniform"
-        and len(space.get("syntax_loss_weight", [0.0])) > 1
-    )
-    if use_uniform_syntax:
-        space.pop("syntax_loss_weight", None)
     config = {name: trial.suggest_categorical(name, choices) for name, choices in space.items()}
-    if use_uniform_syntax:
-        hi = float(args.syntax_loss_weight_high)
-        config["syntax_loss_weight"] = trial.suggest_float("syntax_loss_weight", 0.0, hi)
+    hi = float(args.syntax_loss_weight_high)
+    lo = _SYNTAX_LOSS_UNIFORM_LO if getattr(args, "require_syntax_span_loss", False) else 0.0
+    config["syntax_loss_weight"] = trial.suggest_float("syntax_loss_weight", lo, hi)
     return config
 
 
@@ -400,6 +402,7 @@ def summarise_trials(study, primary_metric, limit=15):
     )
     leaderboard = []
     for trial in completed[:limit]:
+        res = trial.user_attrs.get("result") or {}
         leaderboard.append(
             {
                 "trial_number": trial.number,
@@ -407,7 +410,8 @@ def summarise_trials(study, primary_metric, limit=15):
                 "value": trial.value,
                 "config": trial.user_attrs.get("config"),
                 "result_path": trial.user_attrs.get("result_path"),
-                "metrics": (trial.user_attrs.get("result") or {}).get("best"),
+                "metrics": res.get("best"),
+                "threshold_tuning": res.get("threshold_tuning"),
             }
         )
     return leaderboard
@@ -427,13 +431,15 @@ def write_artifacts(study, output_dir, primary_metric):
         "leaderboard": summarise_trials(study, primary_metric),
     }
     if best_trial is not None:
+        res = best_trial.user_attrs.get("result") or {}
         summary["best_trial"] = {
             "trial_number": best_trial.number,
             "value": best_trial.value,
             "phase": best_trial.user_attrs.get("phase"),
             "config": best_trial.user_attrs.get("config"),
             "result_path": best_trial.user_attrs.get("result_path"),
-            "metrics": (best_trial.user_attrs.get("result") or {}).get("best"),
+            "metrics": res.get("best"),
+            "threshold_tuning": res.get("threshold_tuning"),
         }
     with open(output_dir / "study_summary.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, ensure_ascii=False)
@@ -549,10 +555,15 @@ def main():
     ACTIVE_SEARCH_SPACE = dict(SEARCH_SPACE)
     silver_path = work_dir / "datasets" / f"{args.dataset}_silver_spans.pkl"
     if not silver_path.is_file():
-        ACTIVE_SEARCH_SPACE["syntax_loss_weight"] = [0.0]
+        if args.require_syntax_span_loss:
+            raise SystemExit(
+                f"--require-syntax-span-loss requires {silver_path}.\n"
+                f"  python scripts/build_hkt_silver_span_cache.py --dataset {args.dataset}"
+            )
+        args.syntax_loss_weight_high = 0.0
         print(
             "NOTICE: HKT Optuna — "
-            f"datasets/{args.dataset}_silver_spans.pkl not found; syntax_loss_weight is restricted to [0.0]. "
+            f"datasets/{args.dataset}_silver_spans.pkl not found; syntax_loss_weight pinned to 0.0. "
             "Build cache with:\n"
             f"  python scripts/build_hkt_silver_span_cache.py --dataset {args.dataset}",
             flush=True,
@@ -586,13 +597,10 @@ def main():
             "(pass --n_epochs 5 to reproduce old behaviour).",
             flush=True,
         )
+    lo = _SYNTAX_LOSS_UNIFORM_LO if getattr(args, "require_syntax_span_loss", False) else 0.0
     print(
-        f"syntax_loss_weight sampling: {args.syntax_loss_weight_sampling}"
-        + (
-            f" (uniform [0, {args.syntax_loss_weight_high}])"
-            if args.syntax_loss_weight_sampling == "uniform"
-            else ""
-        ),
+        f"syntax_loss_weight: uniform [{lo}, {args.syntax_loss_weight_high}]"
+        + (" (require-syntax-span-loss)" if getattr(args, "require_syntax_span_loss", False) else ""),
         flush=True,
     )
 

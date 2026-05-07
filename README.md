@@ -81,6 +81,13 @@ python scripts/build_hkt_silver_span_cache.py --dataset mustard --fold 0 --seed 
 python scripts/build_hkt_silver_span_cache.py --dataset urfunny
 ```
 
+**UR-FUNNY official word lists (SDK):** Prebuilt `datasets/ur_funny.pkl` often stores the punchline as a single string, so training uses `heuristic_word_tokenize`. To use **UR-FUNNY `language_sdk` word sequences** (`punchline_features`, aligned with multimodal features), export a fresh HKT pickle from the v2 feature zip + local `datasets/urfunny.pkl`, then rebuild the silver cache:
+
+```bash
+python scripts/export_urfunny_hkt_from_sdk.py --backup --archive /path/to/urfunny_v2_features.zip
+python scripts/build_hkt_silver_span_cache.py --dataset urfunny --overwrite
+```
+
 **HKT Optuna:** `scripts/optuna_hkt_search.py` includes `syntax_loss_weight` in its search space; if `datasets/<dataset>_silver_spans.pkl` is missing, the driver prints a notice and restricts `syntax_loss_weight` to `[0.0]` (same idea as SIMSv2 aligned search).
 
 **Study sqlite:** Switching between `aligned` and `wide` changes suggested parameter names; reuse the same `optuna_study.sqlite3` only if you know what you are doing. Prefer a new `--study_prefix` or `--output_dir` for a clean aligned run.
@@ -123,6 +130,7 @@ Treat `baseline_table.tex` as the single source for the exact figures you cite i
 | `scripts/optuna_search.py` | Optuna for mosi / mosei / simsv2 |
 | `scripts/build_simsv2_silver_span_cache.py` | Normalize SIMSv2 pickle + benepar silver cache |
 | `scripts/build_hkt_silver_span_cache.py` | Benepar silver cache for MUStARD / UR-FUNNY HKT pickles |
+| `scripts/export_urfunny_hkt_from_sdk.py` | Rebuild `datasets/ur_funny.pkl` with SDK `punchline_features` word lists |
 | `scripts/optuna_hkt_search.py` | Optuna for HKT datasets |
 | `log/` | Ignored by git — store Optuna DBs and trial logs here |
 

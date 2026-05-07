@@ -17,7 +17,8 @@
 #   FLEET_OUT — default log/4080_restart (mustard + urfunny + simsv2 sqlite + trial_logs)
 #   OPTUNA_GPU, MUSTARD_GPU, URFUNNY_GPU, SIMSV2_GPU
 #   *_RANDOM_TRIALS, *_TPE_TRIALS, SIMSV2_BASE_MODEL
-#   HKT_STUDY_PREFIX, SIMSV2_STUDY_PREFIX (default timestamped new studies)
+#   REQUIRE_SYNTAX_SPAN_LOSS — default 0; if 1, passes --require-syntax-span-loss to HKT Optuna
+#     (every trial uses non-zero syntax_loss_weight; needs silver span pickles; use fresh HKT_STUDY_PREFIX).
 #   STOP_PRIOR_FLEET — default 1: kill prior fleet driver PIDs (mustard/urfunny/simsv2
 #     from log/silver_span_optuna/*.pid) + stray mustard/urfunny HKT processes.
 #   STOP_PRIOR_SIMSV2 — default 0: if 1, also pkill every simsv2 optuna_search/train.py
@@ -114,6 +115,9 @@ SIMSV2_TPE_TRIALS="${SIMSV2_TPE_TRIALS:-100}"
 HKT_EXTRA_ARGS=()
 if [[ -n "${HKT_N_EPOCHS:-}" ]]; then HKT_EXTRA_ARGS+=(--n_epochs "$HKT_N_EPOCHS"); fi
 if [[ -n "${HKT_EARLY_STOP_PATIENCE:-}" ]]; then HKT_EXTRA_ARGS+=(--early_stopping_patience "$HKT_EARLY_STOP_PATIENCE"); fi
+if [[ "${REQUIRE_SYNTAX_SPAN_LOSS:-0}" == "1" ]]; then
+  HKT_EXTRA_ARGS+=(--require-syntax-span-loss)
+fi
 
 BASE_MODEL_ARGS=()
 if [[ -n "${SIMSV2_BASE_MODEL:-}" ]]; then
@@ -124,7 +128,7 @@ cat >"$OUT_DIR/README.txt" <<EOF
 Silver-span Optuna fleet — unified under FLEET_OUT=$FLEET_OUT (HKT_OUT=$HKT_OUT, SIMSV2_OUT=$SIMSV2_OUT).
 Started: $(date -Is)
 Study prefixes: HKT=$HKT_STUDY_PREFIX | simsv2=$SIMSV2_STUDY_PREFIX
-Optional HKT overrides: HKT_N_EPOCHS, HKT_EARLY_STOP_PATIENCE (passed to optuna_hkt_search when set).
+Optional HKT overrides: HKT_N_EPOCHS, HKT_EARLY_STOP_PATIENCE, REQUIRE_SYNTAX_SPAN_LOSS=1 (non-zero silver syntax loss).
 MUStARD  -> GPU $MUSTARD_GPU  | $HKT_OUT/mustard  | random=$MUSTARD_RANDOM_TRIALS  tpe=$MUSTARD_TPE_TRIALS
 UR-FUNNY -> GPU $URFUNNY_GPU | $HKT_OUT/urfunny | random=$URFUNNY_RANDOM_TRIALS tpe=$URFUNNY_TPE_TRIALS
 SIMSv2   -> GPU $SIMSV2_GPU  | $SIMSV2_OUT/simsv2 | random=$SIMSV2_RANDOM_TRIALS tpe=$SIMSV2_TPE_TRIALS
