@@ -1,6 +1,9 @@
 __pycache__/
 *.py[cod]
 
+# Claude Code — local overrides (may contain API keys / machine paths)
+.claude/settings.local.json
+
 datasets/*.pkl
 datasets/hkt/
 log/
@@ -15,3 +18,7 @@ recursive_ITHP_manuscript/*.blg
 recursive_ITHP_manuscript/*.out
 recursive_ITHP_manuscript/*.pdf
 334_Learning_by_Comparing_Boos.pdf
+
+# Local run state
+ablation_study/logs/*.pid
+fixed_experiment/*.pid

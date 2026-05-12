@@ -1,0 +1,26 @@
+[
+  {
+    "id": "mosi_full_t278",
+    "runner": "fixed",
+    "config": "configs/mosi/full_t278.json",
+    "description": "MOSI full (trial 278); explicit acc7_loss_weight 0.2"
+  },
+  {
+    "id": "mosi_A1_no_syntax_sup",
+    "runner": "fixed",
+    "config": "configs/mosi/A1_no_syntax_sup.json",
+    "description": "MOSI A1: silver_span_loss_weight 0"
+  },
+  {
+    "id": "mosi_A3_no_recursion_refine",
+    "runner": "fixed",
+    "config": "configs/mosi/A3_no_recursion_refine.json",
+    "description": "MOSI A3: max_recursion_depth 1"
+  },
+  {
+    "id": "mosi_A4_ib_no_stage2",
+    "runner": "fixed",
+    "config": "configs/mosi/A4_ib_no_stage2.json",
+    "description": "MOSI A4: p_lambda 0"
+  }
+]
