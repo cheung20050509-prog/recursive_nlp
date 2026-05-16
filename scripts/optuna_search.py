@@ -13,6 +13,13 @@ Prefer a new ``--study_prefix`` or ``--output_dir`` when switching space. Defaul
 
 Optional: ``--silver-span-loss-weight-sampling uniform`` samples the weight with
 ``suggest_float`` in ``[0, --silver-span-loss-weight-high]`` (new study only).
+
+Warm-start (``--import-mode enqueue``): before phase-1, queue the top ``--seed-top-k``
+completed configs from ``--seed-sqlite`` / ``--seed-study-name`` (e.g. prior acc7-on
+study) so they are **re-run first** under the current train flags (e.g. ``--acc7_loss_weight 0``).
+Requires an **empty** target sqlite (delete it to re-seed). Phase-1 trial budget is
+``max(--random-trials, enqueued_count)`` so enqueued trials are not skipped when
+``--random-trials`` is small.
 """
 
 import argparse
@@ -195,6 +202,49 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--acc7-loss-weight",
+        dest="acc7_loss_weight",
+        default=None,
+        type=float,
+        help=(
+            "If set, passed to train.py as --acc7_loss_weight (default in train.py is 0.2). "
+            "Use 0 to disable the Acc7 auxiliary cross-entropy (must use a new --study_prefix / "
+            "output dir — do not mix with trials trained with Acc7 loss)."
+        ),
+    )
+    parser.add_argument(
+        "--import-mode",
+        dest="import_mode",
+        choices=["none", "enqueue"],
+        default="none",
+        help=(
+            "enqueue: if the target study has zero trials, enqueue top --seed-top-k configs "
+            "from --seed-sqlite (re-run first). Do not use history import here (MAE values "
+            "would be incompatible across acc7 on/off)."
+        ),
+    )
+    parser.add_argument(
+        "--seed-sqlite",
+        dest="seed_sqlite",
+        default="",
+        type=str,
+        help="Prior Optuna sqlite (e.g. log/4080_restart/mosei/optuna_study.sqlite3).",
+    )
+    parser.add_argument(
+        "--seed-study-name",
+        dest="seed_study_name",
+        default="",
+        type=str,
+        help="Study name inside --seed-sqlite (e.g. ithp_mosei_mae).",
+    )
+    parser.add_argument(
+        "--seed-top-k",
+        dest="seed_top_k",
+        default=5,
+        type=int,
+        help="How many best prior trials to enqueue (default: 5).",
+    )
+    parser.add_argument(
         "--silver-span-loss-weight-high",
         default=0.25,
         type=float,
@@ -221,6 +271,11 @@ def parse_args():
         )
     if args.silver_span_loss_weight_sampling == "uniform" and args.silver_span_loss_weight_high <= 0:
         raise SystemExit("--silver-span-loss-weight-high must be > 0 when using uniform silver weight sampling")
+    if args.import_mode == "enqueue":
+        if args.dataset not in ("mosi", "mosei"):
+            raise SystemExit("--import-mode enqueue is only supported for dataset=mosi|mosei")
+        if not args.seed_sqlite or not args.seed_study_name:
+            raise SystemExit("--import-mode enqueue requires --seed-sqlite and --seed-study-name")
     return args
 
 
@@ -271,6 +326,7 @@ def build_train_command(
     early_stopping_patience,
     base_model=None,
     work_dir: Path | None = None,
+    acc7_loss_weight=None,
 ):
     wd = work_dir or Path(".")
     if dataset == "simsv2":
@@ -299,6 +355,8 @@ def build_train_command(
     ]
     for key, value in config.items():
         command.extend([f"--{key}", str(value)])
+    if acc7_loss_weight is not None:
+        command.extend(["--acc7_loss_weight", str(acc7_loss_weight)])
     if base_model:
         command.extend(["--model", str(base_model)])
     return command
@@ -341,6 +399,80 @@ def _merge_frozen_categorical_distributions(study: optuna.Study, space: dict) ->
         if isinstance(cur, (list, tuple)) and tuple(cur) != choices:
             merged[name] = list(choices)
     return merged
+
+
+def _load_prior_optuna_study(seed_sqlite: str, seed_study_name: str):
+    if not seed_sqlite or not Path(seed_sqlite).is_file():
+        print(f"[seed] no prior sqlite at {seed_sqlite!r}; skipping.", flush=True)
+        return None
+    try:
+        return optuna.load_study(
+            study_name=seed_study_name,
+            storage=f"sqlite:///{Path(seed_sqlite).resolve()}",
+        )
+    except KeyError:
+        print(f"[seed] study {seed_study_name!r} not found in {seed_sqlite}", flush=True)
+        return None
+
+
+def clip_config_to_space(config: dict, space: dict) -> dict:
+    snapped = {}
+    for name, choices in space.items():
+        if name not in config:
+            continue
+        value = config[name]
+        if value in choices:
+            snapped[name] = value
+            continue
+        str_choices = {str(c): c for c in choices}
+        if str(value) in str_choices:
+            snapped[name] = str_choices[str(value)]
+            continue
+        try:
+            snapped[name] = min(choices, key=lambda c: abs(float(c) - float(value)))
+        except Exception:
+            snapped[name] = choices[0]
+    return snapped
+
+
+def enqueue_top_k_from_prior_study(target_study, args, work_dir: Path) -> int:
+    """Queue top-K configs from a prior study so they run first (same hparam space)."""
+    prior = _load_prior_optuna_study(args.seed_sqlite, args.seed_study_name)
+    if prior is None:
+        return 0
+    completed = [t for t in prior.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if not completed:
+        print("[seed] prior study has no complete trials.", flush=True)
+        return 0
+    reverse = METRIC_DIRECTIONS[args.primary_metric] == "maximize"
+    completed.sort(
+        key=lambda t: (
+            t.value if t.value is not None else (float("-inf") if reverse else float("inf"))
+        ),
+        reverse=reverse,
+    )
+    space = resolve_search_space(args.dataset, args, work_dir)
+    space = _merge_frozen_categorical_distributions(target_study, space)
+    k = max(0, int(args.seed_top_k))
+    enqueued = 0
+    seen = set()
+    for pt in completed[:k]:
+        cfg = pt.user_attrs.get("config")
+        if not isinstance(cfg, dict):
+            cfg = dict(pt.params)
+        snapped = clip_config_to_space(cfg, space)
+        sig = json.dumps(snapped, sort_keys=True, default=str)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        target_study.enqueue_trial(snapped)
+        enqueued += 1
+        print(
+            f"[seed] enqueued from prior trial #{pt.number} value={pt.value!r} -> {snapped}",
+            flush=True,
+        )
+    print(f"[seed] enqueued {enqueued} configs from {args.seed_study_name}", flush=True)
+    return enqueued
 
 
 def suggest_config(trial, args, work_dir: Path):
@@ -442,6 +574,7 @@ def run_trial(trial, args, phase_name, work_dir, output_dir):
         args.early_stopping_patience,
         base_model=args.base_model,
         work_dir=work_dir,
+        acc7_loss_weight=args.acc7_loss_weight,
     )
 
     print(f"[{phase_name}][Trial {trial.number}] Config: {config}")
@@ -564,12 +697,36 @@ def main():
         ),
         flush=True,
     )
+    if args.acc7_loss_weight is not None:
+        print(f"train.py --acc7_loss_weight={args.acc7_loss_weight} (explicit)", flush=True)
     if args.dataset == "simsv2":
         print(
             f"SIMSv2: --simsv2-search-space={args.simsv2_search_space}, "
             f"random_trials={args.random_trials}, tpe_trials={args.tpe_trials}",
             flush=True,
         )
+
+    warm_study = optuna.create_study(
+        study_name=study_name,
+        storage=storage_uri,
+        load_if_exists=True,
+        direction=METRIC_DIRECTIONS[args.primary_metric],
+    )
+    n_any = len(warm_study.trials)
+    n_complete = sum(
+        1 for t in warm_study.trials if t.state == optuna.trial.TrialState.COMPLETE
+    )
+    enqueued = 0
+    if n_any == 0 and args.import_mode == "enqueue":
+        enqueued = enqueue_top_k_from_prior_study(warm_study, args, work_dir)
+    elif args.import_mode == "enqueue" and n_any > 0:
+        print(
+            f"[seed] target study already has {n_any} trial(s) ({n_complete} complete); "
+            "skipping enqueue. Delete optuna_study.sqlite3 (and trial_logs if needed) to re-seed.",
+            flush=True,
+        )
+
+    random_phase_trials = max(args.random_trials, enqueued) if enqueued else args.random_trials
 
     random_sampler = optuna.samplers.RandomSampler(seed=args.seed)
     study = run_phase(
@@ -580,7 +737,7 @@ def main():
         output_dir,
         phase_name="random",
         sampler=random_sampler,
-        n_trials=args.random_trials,
+        n_trials=random_phase_trials,
     )
 
     tpe_sampler = optuna.samplers.TPESampler(

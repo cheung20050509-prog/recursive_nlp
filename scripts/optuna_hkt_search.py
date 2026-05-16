@@ -170,6 +170,28 @@ def parse_args():
         help="MUStARD: pin to a specific speaker-independent fold. Default: HKT pickle single split.",
     )
     parser.add_argument("--study_prefix", default="ithp_hkt", type=str)
+    parser.add_argument(
+        "--import-mode",
+        dest="import_mode",
+        choices=["none", "enqueue"],
+        default="none",
+        help="enqueue: if target study is empty, queue top --seed-top-k configs from --seed-sqlite first.",
+    )
+    parser.add_argument(
+        "--seed-sqlite",
+        dest="seed_sqlite",
+        default="",
+        type=str,
+        help="Prior HKT Optuna sqlite (e.g. log/4080_restart/urfunny/optuna_study.sqlite3).",
+    )
+    parser.add_argument(
+        "--seed-study-name",
+        dest="seed_study_name",
+        default="",
+        type=str,
+        help="Study name inside --seed-sqlite.",
+    )
+    parser.add_argument("--seed-top-k", dest="seed_top_k", default=5, type=int)
     parser.add_argument("--tpe_startup_trials", default=10, type=int)
     parser.add_argument(
         "--github_style",
@@ -269,6 +291,8 @@ def parse_args():
                 "setting --decision-threshold-mode tune_on_valid",
                 flush=True,
             )
+    if args.import_mode == "enqueue" and (not args.seed_sqlite or not args.seed_study_name):
+        raise SystemExit("--import-mode enqueue requires --seed-sqlite and --seed-study-name")
     return args
 
 
@@ -379,6 +403,90 @@ def suggest_config(trial, args):
     lo = _SYNTAX_LOSS_UNIFORM_LO if getattr(args, "require_syntax_span_loss", False) else 0.0
     config["syntax_loss_weight"] = trial.suggest_float("syntax_loss_weight", lo, hi)
     return config
+
+
+def _load_prior_hkt_study(seed_sqlite: str, seed_study_name: str):
+    if not seed_sqlite or not Path(seed_sqlite).is_file():
+        print(f"[seed] no prior sqlite at {seed_sqlite!r}; skipping.", flush=True)
+        return None
+    try:
+        return optuna.load_study(
+            study_name=seed_study_name,
+            storage=f"sqlite:///{Path(seed_sqlite).resolve()}",
+        )
+    except KeyError:
+        print(f"[seed] study {seed_study_name!r} not in {seed_sqlite}", flush=True)
+        return None
+
+
+def _clip_hkt_categorical(config: dict, space: dict) -> dict:
+    snapped = {}
+    for name, choices in space.items():
+        if name not in config:
+            continue
+        value = config[name]
+        if value in choices:
+            snapped[name] = value
+            continue
+        str_choices = {str(c): c for c in choices}
+        if str(value) in str_choices:
+            snapped[name] = str_choices[str(value)]
+            continue
+        try:
+            snapped[name] = min(choices, key=lambda c: abs(float(c) - float(value)))
+        except Exception:
+            snapped[name] = choices[0]
+    return snapped
+
+
+def enqueue_hkt_top_k_from_prior(target_study, args) -> int:
+    prior = _load_prior_hkt_study(args.seed_sqlite, args.seed_study_name)
+    if prior is None:
+        return 0
+    completed = [t for t in prior.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if not completed:
+        print("[seed] prior study has no complete trials.", flush=True)
+        return 0
+    reverse = METRIC_DIRECTIONS[args.primary_metric] == "maximize"
+    completed.sort(
+        key=lambda t: (
+            t.value if t.value is not None else (float("-inf") if reverse else float("inf"))
+        ),
+        reverse=reverse,
+    )
+    space = dict(ACTIVE_SEARCH_SPACE)
+    space = _merge_frozen_categorical_distributions(target_study, space)
+    lo = _SYNTAX_LOSS_UNIFORM_LO if getattr(args, "require_syntax_span_loss", False) else 0.0
+    hi = float(args.syntax_loss_weight_high)
+    k = max(0, int(args.seed_top_k))
+    enqueued = 0
+    seen = set()
+    for pt in completed[:k]:
+        cfg = pt.user_attrs.get("config")
+        if not isinstance(cfg, dict):
+            cfg = dict(pt.params)
+        snapped = _clip_hkt_categorical(cfg, space)
+        missing = [name for name in space if name not in snapped]
+        if missing:
+            print(f"[seed] skip prior trial #{pt.number}: missing categoricals {missing}", flush=True)
+            continue
+        if "syntax_loss_weight" in cfg:
+            w = float(cfg["syntax_loss_weight"])
+            snapped["syntax_loss_weight"] = max(lo, min(hi, w))
+        else:
+            snapped["syntax_loss_weight"] = max(lo, min(hi, (lo + hi) / 2.0))
+        sig = json.dumps(snapped, sort_keys=True, default=str)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        target_study.enqueue_trial(snapped)
+        enqueued += 1
+        print(
+            f"[seed] enqueued from prior trial #{pt.number} value={pt.value!r} -> {snapped}",
+            flush=True,
+        )
+    print(f"[seed] enqueued {enqueued} HKT configs from {args.seed_study_name}", flush=True)
+    return enqueued
 
 
 def count_completed_trials(study, phase_name):
@@ -604,6 +712,24 @@ def main():
         flush=True,
     )
 
+    warm_study = optuna.create_study(
+        study_name=study_name,
+        storage=storage_uri,
+        load_if_exists=True,
+        direction=METRIC_DIRECTIONS[args.primary_metric],
+    )
+    n_any = len(warm_study.trials)
+    enqueued = 0
+    if n_any == 0 and args.import_mode == "enqueue":
+        enqueued = enqueue_hkt_top_k_from_prior(warm_study, args)
+    elif args.import_mode == "enqueue" and n_any > 0:
+        print(
+            f"[seed] target study already has {n_any} trial(s); skipping enqueue. "
+            "Delete optuna_study.sqlite3 to re-seed.",
+            flush=True,
+        )
+    random_phase_trials = max(args.random_trials, enqueued) if enqueued else args.random_trials
+
     random_sampler = optuna.samplers.RandomSampler(seed=args.seed)
     study = run_phase(
         args,
@@ -613,7 +739,7 @@ def main():
         output_dir,
         phase_name="random",
         sampler=random_sampler,
-        n_trials=args.random_trials,
+        n_trials=random_phase_trials,
     )
 
     tpe_sampler = optuna.samplers.TPESampler(

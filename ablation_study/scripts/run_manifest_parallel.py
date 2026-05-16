@@ -36,6 +36,7 @@ def _build_cmd(
     py: str,
     fixed_extra: list[str],
     hkt_extra: list[str],
+    save_checkpoint_path: str | None,
 ) -> tuple[str, list[str]] | None:
     rid = row.get("id", f"entry_{i}")
     runner = row.get("runner")
@@ -50,6 +51,8 @@ def _build_cmd(
 
     if runner == "fixed":
         cmd = [py, "-u", str(run_fixed), "--config", str(cfg_path), *fixed_extra]
+        if save_checkpoint_path:
+            cmd.extend(["--save_checkpoint", save_checkpoint_path])
     elif runner == "hkt_urfunny":
         cmd = [py, "-u", str(launch_hkt), str(cfg_path), *hkt_extra]
     else:
@@ -114,6 +117,18 @@ def main() -> int:
         action="store_true",
         help="Do not stop the pool when a job fails; exit non-zero if any failed",
     )
+    ap.add_argument(
+        "--save-checkpoints",
+        action="store_true",
+        help="For fixed runs: append --save_checkpoint ABS_PATH with ABS_PATH = "
+        "<checkpoint-dir>/<manifest id>.pt (written whenever validation improves best).",
+    )
+    ap.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="",
+        help="Directory for --save-checkpoints (default: <ablation_study>/checkpoints). Created if missing.",
+    )
     ap.add_argument("--dry-run", action="store_true", help="Print planned commands only")
     args = ap.parse_args()
 
@@ -177,9 +192,20 @@ def main() -> int:
             print(f"shlex split error: {e}", file=sys.stderr)
             return 2
 
+    ckpt_dir: Path | None = None
+    if args.save_checkpoints:
+        ckpt_dir = Path(args.checkpoint_dir).resolve() if args.checkpoint_dir.strip() else (ablation_root / "checkpoints").resolve()
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
     planned: list[tuple[str, list[str]]] = []
     for i, row in enumerate(slice_entries):
-        b = _build_cmd(row, i, ablation_root, run_fixed, launch_hkt, py, fixed_extra, hkt_extra)
+        rid = row.get("id", f"entry_{i}")
+        save_path: str | None = None
+        if args.save_checkpoints and ckpt_dir is not None:
+            save_path = str((ckpt_dir / f"{rid}.pt").resolve())
+        b = _build_cmd(
+            row, i, ablation_root, run_fixed, launch_hkt, py, fixed_extra, hkt_extra, save_path
+        )
         if b:
             planned.append(b)
 

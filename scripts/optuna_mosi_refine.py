@@ -159,6 +159,16 @@ def parse_args():
              "enqueue: queue prior top-K configs to be RE-RUN once; none: cold start.",
     )
     parser.add_argument("--seed_top_k", default=5, type=int)
+    parser.add_argument(
+        "--acc7-loss-weight",
+        dest="acc7_loss_weight",
+        default=None,
+        type=float,
+        help=(
+            "If set, passed to train.py as --acc7_loss_weight (train.py default is 0.2). "
+            "Use 0 to disable Acc7 auxiliary loss."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -197,7 +207,13 @@ def format_metric(metrics, metric_name):
     return f"{value:.4f}"
 
 
-def build_train_command(config, n_epochs, selection_metric, early_stopping_patience):
+def build_train_command(
+    config,
+    n_epochs,
+    selection_metric,
+    early_stopping_patience,
+    acc7_loss_weight=None,
+):
     command = [
         PYTHON,
         "-u",
@@ -217,6 +233,8 @@ def build_train_command(config, n_epochs, selection_metric, early_stopping_patie
     ]
     for key, value in config.items():
         command.extend([f"--{key}", str(value)])
+    if acc7_loss_weight is not None:
+        command.extend(["--acc7_loss_weight", str(acc7_loss_weight)])
     return command
 
 
@@ -443,7 +461,13 @@ def run_trial(trial, args, phase_name, work_dir, output_dir):
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    command = build_train_command(config, args.n_epochs, args.selection_metric, args.early_stopping_patience)
+    command = build_train_command(
+        config,
+        args.n_epochs,
+        args.selection_metric,
+        args.early_stopping_patience,
+        acc7_loss_weight=args.acc7_loss_weight,
+    )
 
     print(f"[{phase_name}][Trial {trial.number}] Config: {config}", flush=True)
     print(f"[{phase_name}][Trial {trial.number}] Log: {log_path}", flush=True)
@@ -537,6 +561,8 @@ def main():
     print(f"Epochs per trial: {args.n_epochs}")
     print(f"Early stopping patience: {args.early_stopping_patience}")
     print(f"Search space: {json.dumps(SEARCH_SPACE, ensure_ascii=False)}")
+    if args.acc7_loss_weight is not None:
+        print(f"train.py --acc7_loss_weight={args.acc7_loss_weight} (explicit)", flush=True)
 
     # Warm-start the new study from the prior study. ``import_mode=history``
     # copies every prior completed trial as FrozenTrial snapshots so TPE
@@ -547,16 +573,18 @@ def main():
         load_if_exists=True,
         direction=METRIC_DIRECTIONS[args.primary_metric],
     )
-    already_has_trials = bool(warm_study.trials)
-    if not already_has_trials:
+    enqueued = 0
+    if len(warm_study.trials) == 0:
         if args.import_mode == "history":
             import_prior_history(warm_study, args)
         elif args.import_mode == "enqueue":
-            enqueue_prior_best(warm_study, args)
+            enqueued = enqueue_prior_best(warm_study, args)
         else:
             print("[seed] import_mode=none; skipping warm start.")
     else:
-        print(f"[seed] study already contains {len(warm_study.trials)} trials; skipping warm start.")
+        print(f"[seed] study already contains {len(warm_study.trials)} trial(s); skipping warm start.")
+
+    random_phase_trials = max(args.random_trials, enqueued) if enqueued else args.random_trials
 
     random_sampler = optuna.samplers.RandomSampler(seed=args.seed)
     study = run_phase(
@@ -567,7 +595,7 @@ def main():
         output_dir,
         phase_name="random",
         sampler=random_sampler,
-        n_trials=args.random_trials,
+        n_trials=random_phase_trials,
     )
 
     tpe_sampler = optuna.samplers.TPESampler(

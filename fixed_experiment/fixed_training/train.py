@@ -59,31 +59,49 @@ parser.add_argument('--merge_trace_samples', default=3, type=int)
 parser.add_argument('--max_grad_norm', default=1.0, type=float)
 parser.add_argument('--selection_metric', default='valid_loss', choices=['valid_loss', 'mae'], type=str)
 parser.add_argument('--early_stopping_patience', default=0, type=int)
+parser.add_argument(
+    '--save_checkpoint',
+    default='',
+    type=str,
+    help='If non-empty, save best model state_dict to this path whenever validation improves.',
+)
 
-args = parser.parse_args()
+args = None  # set by configure_runtime() before any training / data code runs
 
-if args.max_recursion_depth < 1:
-    raise ValueError('max_recursion_depth must be at least 1')
 
-if args.early_stopping_patience < 0:
-    raise ValueError('early_stopping_patience must be non-negative')
+def configure_runtime(parsed_args):
+    """
+    Apply post-parse side effects (chdir, globals). Call once after parse_args().
+    Importable so embedding-export scripts can rebuild the same runtime from a saved checkpoint dict.
+    """
+    global args, ACOUSTIC_DIM, VISUAL_DIM, TEXT_DIM
+    args = parsed_args
 
-os.chdir(str(ithp_workdir()))
+    if args.max_recursion_depth < 1:
+        raise ValueError('max_recursion_depth must be at least 1')
 
-global_configs.MAX_RECURSION_DEPTH = args.max_recursion_depth
+    if args.early_stopping_patience < 0:
+        raise ValueError('early_stopping_patience must be non-negative')
 
-_DEBERTA_DEFAULT = "/root/autodl-tmp/recursive_language/deberta-v3-base"
-if args.dataset == "simsv2":
-    # CH-SIMSv2: regression in [-1, 1]; MOSI-style Acc7 auxiliary does not apply.
-    args.acc7_loss_weight = 0.0
-    _repo = ithp_workdir()
-    _local_zh = _repo / "pretrained" / "bert-base-chinese"
-    if args.model == _DEBERTA_DEFAULT or "deberta" in os.path.basename(os.path.normpath(args.model)).lower():
-        args.model = str(_local_zh) if _local_zh.is_dir() else "google-bert/bert-base-chinese"
+    os.chdir(str(ithp_workdir()))
 
-global_configs.set_dataset_config(args.dataset)
-ACOUSTIC_DIM, VISUAL_DIM, TEXT_DIM = (global_configs.ACOUSTIC_DIM, global_configs.VISUAL_DIM,
-                                      global_configs.TEXT_DIM)
+    global_configs.MAX_RECURSION_DEPTH = args.max_recursion_depth
+
+    _DEBERTA_DEFAULT = "/root/autodl-tmp/recursive_language/deberta-v3-base"
+    if args.dataset == "simsv2":
+        # CH-SIMSv2: regression in [-1, 1]; MOSI-style Acc7 auxiliary does not apply.
+        args.acc7_loss_weight = 0.0
+        _repo = ithp_workdir()
+        _local_zh = _repo / "pretrained" / "bert-base-chinese"
+        if args.model == _DEBERTA_DEFAULT or "deberta" in os.path.basename(os.path.normpath(args.model)).lower():
+            args.model = str(_local_zh) if _local_zh.is_dir() else "google-bert/bert-base-chinese"
+
+    global_configs.set_dataset_config(args.dataset)
+    ACOUSTIC_DIM, VISUAL_DIM, TEXT_DIM = (
+        global_configs.ACOUSTIC_DIM,
+        global_configs.VISUAL_DIM,
+        global_configs.TEXT_DIM,
+    )
 
 class InputFeatures(object):
     """A single set of features of data."""
@@ -442,7 +460,7 @@ def get_appropriate_dataset(data, silver_records=None):
     return dataset
 
 
-def set_up_data_loader():
+def set_up_data_loader(test_shuffle: bool = True):
     with open(f"datasets/{args.dataset}.pkl", "rb") as handle:
         data = pickle.load(handle)
 
@@ -504,7 +522,7 @@ def set_up_data_loader():
     )
 
     test_dataloader = DataLoader(
-        test_dataset, batch_size=args.test_batch_size, shuffle=True,
+        test_dataset, batch_size=args.test_batch_size, shuffle=test_shuffle,
     )
 
     return (
@@ -942,6 +960,15 @@ def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero=Fal
     return metrics, avg_recursion_steps, max_depth_hit_rate, syntax_samples, avg_syntax_loss
 
 
+def _save_best_checkpoint(path: str, state_dict: dict) -> None:
+    if not path:
+        return
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"model": state_dict, "args": vars(args)}, out)
+    print(f"CHECKPOINT: saved best weights to {out}")
+
+
 def train(
         model,
         train_dataloader,
@@ -986,6 +1013,7 @@ def train(
             best_epoch = epoch_i + 1
             best_train_loss = train_loss
             best_state_dict = copy.deepcopy(model.state_dict())
+            _save_best_checkpoint(getattr(args, "save_checkpoint", ""), best_state_dict)
             best_train_avg_steps = train_avg_steps
             best_valid_avg_steps = valid_avg_steps
             best_train_hit_rate = train_hit_rate
@@ -1136,4 +1164,5 @@ def main():
 
 
 if __name__ == '__main__':
+    configure_runtime(parser.parse_args())
     main()
