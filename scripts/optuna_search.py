@@ -80,6 +80,7 @@ METRIC_DIRECTIONS = {
     "acc2_no_zero": "maximize",
     "f1_score_no_zero": "maximize",
     "mae": "minimize",
+    "valid_mae": "minimize",
     "corr": "maximize",
     "test_acc": "maximize",
 }
@@ -243,6 +244,12 @@ def parse_args():
         default=5,
         type=int,
         help="How many best prior trials to enqueue (default: 5).",
+    )
+    parser.add_argument(
+        "--bootstrap-config",
+        default="",
+        type=str,
+        help="JSON with paper/baseline hyperparameters; enqueued as trial 0 on empty study.",
     )
     parser.add_argument(
         "--silver-span-loss-weight-high",
@@ -475,6 +482,23 @@ def enqueue_top_k_from_prior_study(target_study, args, work_dir: Path) -> int:
     return enqueued
 
 
+def enqueue_bootstrap_config(study, config_path: str, args, work_dir: Path) -> int:
+    path = Path(config_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"--bootstrap-config not found: {path}")
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    cfg = payload.get("hyperparameters", payload)
+    if not isinstance(cfg, dict):
+        raise ValueError(f"{path} must contain a hyperparameters object")
+    space = resolve_search_space(args.dataset, args, work_dir)
+    space = _merge_frozen_categorical_distributions(study, space)
+    snapped = clip_config_to_space(cfg, space)
+    study.enqueue_trial(snapped)
+    print(f"[bootstrap] enqueued paper/baseline config from {path} -> {snapped}", flush=True)
+    return 1
+
+
 def suggest_config(trial, args, work_dir: Path):
     space = resolve_search_space(args.dataset, args, work_dir)
     space = _merge_frozen_categorical_distributions(trial.study, space)
@@ -610,8 +634,9 @@ def run_trial(trial, args, phase_name, work_dir, output_dir):
     print(
         f"[{phase_name}][Trial {trial.number}] DONE in {elapsed:.0f}s — "
         f"{args.primary_metric}={format_metric(metrics, args.primary_metric)}, "
+        f"test_mae={format_metric(metrics, 'mae')}, "
         f"f1_or_F1={format_metric(metrics, 'f1_score_no_zero')}, "
-        f"mae={metrics.get('mae', 'NA')}, best_epoch={metrics.get('best_epoch', 'NA')}"
+        f"best_epoch={metrics.get('best_epoch', 'NA')}"
     )
 
     return primary_value
@@ -717,14 +742,19 @@ def main():
         1 for t in warm_study.trials if t.state == optuna.trial.TrialState.COMPLETE
     )
     enqueued = 0
-    if n_any == 0 and args.import_mode == "enqueue":
-        enqueued = enqueue_top_k_from_prior_study(warm_study, args, work_dir)
+    if n_any == 0:
+        if args.bootstrap_config:
+            enqueued = enqueue_bootstrap_config(warm_study, args.bootstrap_config, args, work_dir)
+        elif args.import_mode == "enqueue":
+            enqueued = enqueue_top_k_from_prior_study(warm_study, args, work_dir)
     elif args.import_mode == "enqueue" and n_any > 0:
         print(
             f"[seed] target study already has {n_any} trial(s) ({n_complete} complete); "
             "skipping enqueue. Delete optuna_study.sqlite3 (and trial_logs if needed) to re-seed.",
             flush=True,
         )
+    elif args.bootstrap_config and n_any > 0:
+        print("[bootstrap] ignored: study is not empty.", flush=True)
 
     random_phase_trials = max(args.random_trials, enqueued) if enqueued else args.random_trials
 

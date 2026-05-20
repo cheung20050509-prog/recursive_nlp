@@ -60,6 +60,7 @@ METRIC_DIRECTIONS = {
     "acc2_no_zero": "maximize",
     "f1_score_no_zero": "maximize",
     "mae": "minimize",
+    "valid_mae": "minimize",
     "corr": "maximize",
     "test_acc": "maximize",
 }
@@ -168,6 +169,12 @@ def parse_args():
             "If set, passed to train.py as --acc7_loss_weight (train.py default is 0.2). "
             "Use 0 to disable Acc7 auxiliary loss."
         ),
+    )
+    parser.add_argument(
+        "--bootstrap-config",
+        default="",
+        type=str,
+        help="JSON with paper/baseline hyperparameters; enqueued as trial 0 on empty study.",
     )
     return parser.parse_args()
 
@@ -343,6 +350,22 @@ def _load_prior_study(args):
         return None
 
 
+def enqueue_bootstrap_config(study, config_path: str) -> int:
+    """Queue a single baseline config (paper reproduction) as the first trial."""
+    path = Path(config_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"--bootstrap-config not found: {path}")
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    cfg = payload.get("hyperparameters", payload)
+    if not isinstance(cfg, dict):
+        raise ValueError(f"{path} must contain a hyperparameters object")
+    snapped = clip_to_space(cfg)
+    study.enqueue_trial(snapped)
+    print(f"[bootstrap] enqueued paper/baseline config from {path} -> {snapped}", flush=True)
+    return 1
+
+
 def enqueue_prior_best(study, args):
     """Queue the top-K prior configs to be RE-RUN in the new space."""
     prior = _load_prior_study(args)
@@ -500,8 +523,9 @@ def run_trial(trial, args, phase_name, work_dir, output_dir):
     print(
         f"[{phase_name}][Trial {trial.number}] DONE in {elapsed:.0f}s — "
         f"{args.primary_metric}={format_metric(metrics, args.primary_metric)}, "
+        f"test_mae={format_metric(metrics, 'mae')}, "
         f"f1_no_zero={format_metric(metrics, 'f1_score_no_zero')}, "
-        f"mae={metrics.get('mae', 'NA')}, best_epoch={metrics.get('best_epoch', 'NA')}",
+        f"best_epoch={metrics.get('best_epoch', 'NA')}",
         flush=True,
     )
     return primary
@@ -575,7 +599,9 @@ def main():
     )
     enqueued = 0
     if len(warm_study.trials) == 0:
-        if args.import_mode == "history":
+        if args.bootstrap_config:
+            enqueued = enqueue_bootstrap_config(warm_study, args.bootstrap_config)
+        elif args.import_mode == "history":
             import_prior_history(warm_study, args)
         elif args.import_mode == "enqueue":
             enqueued = enqueue_prior_best(warm_study, args)
@@ -583,6 +609,8 @@ def main():
             print("[seed] import_mode=none; skipping warm start.")
     else:
         print(f"[seed] study already contains {len(warm_study.trials)} trial(s); skipping warm start.")
+        if args.bootstrap_config:
+            print("[bootstrap] ignored: study is not empty.", flush=True)
 
     random_phase_trials = max(args.random_trials, enqueued) if enqueued else args.random_trials
 
